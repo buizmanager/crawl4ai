@@ -65,3 +65,9 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  # AUTOMATED UPDATE OF DOCKER CONTAINER USING WATCHTOWER
+  watchtower:
+    image: containrrr/watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
