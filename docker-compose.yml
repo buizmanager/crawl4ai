@@ -63,3 +63,13 @@ services:
     image: unclecode/crawl4ai:${VERSION:-basic}-arm64
     profiles: ["hub-arm64"]
     <<: *base-config
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 86400
+
+ 
