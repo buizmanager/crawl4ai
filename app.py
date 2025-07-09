@@ -24,6 +24,9 @@ from pydantic import BaseModel
 # Load environment variables
 load_dotenv()
 
+# Check if running on Hugging Face Spaces
+IS_HF_SPACE = os.environ.get("SPACE_ID") is not None
+
 # Custom WebSocket client implementation
 class JsonRpcRequest(BaseModel):
     jsonrpc: str = "2.0"
@@ -37,8 +40,21 @@ class JsonRpcResponse(BaseModel):
     result: Dict[str, Any]
 
 # Configuration
-CRAWL4AI_API_URL = os.getenv("CRAWL4AI_API_URL", "ws://localhost:11235/mcp/ws")
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "ws://localhost:11235/mcp/ws")
+default_ws_url = "ws://localhost:11235/mcp/ws"
+
+# In Hugging Face Spaces, we need to ensure the WebSocket URL is using wss:// if provided with ws://
+# This is because Spaces requires secure connections
+if IS_HF_SPACE:
+    crawl4ai_url = os.getenv("CRAWL4AI_API_URL", default_ws_url)
+    if crawl4ai_url.startswith("ws://") and not crawl4ai_url.startswith("ws://localhost"):
+        # Convert ws:// to wss:// for non-localhost URLs in Hugging Face Spaces
+        crawl4ai_url = "wss://" + crawl4ai_url[5:]
+    CRAWL4AI_API_URL = crawl4ai_url
+else:
+    CRAWL4AI_API_URL = os.getenv("CRAWL4AI_API_URL", default_ws_url)
+
+# MCP server URL (usually the same as CRAWL4AI_API_URL)
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", CRAWL4AI_API_URL)
 
 class Crawl4AIClient:
     """Client for interacting with a remote Crawl4AI instance"""
@@ -872,9 +888,26 @@ def create_interface():
 # Create and launch the interface
 if __name__ == "__main__":
     demo = create_interface()
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False,
-        show_error=True
-    )
+    # Configure launch parameters based on environment
+    launch_kwargs = {
+        "server_name": "0.0.0.0",
+        "server_port": 7860,
+        "show_error": True,
+        "allowed_paths": ["*"],  # Allow all paths
+        "show_api": False  # Disable API documentation to avoid schema issues
+    }
+    
+    # Special configuration for Hugging Face Spaces
+    if IS_HF_SPACE:
+        # In HF Spaces, we don't need to set share=True and can use specific settings
+        launch_kwargs.update({
+            "share": False,
+            "favicon_path": "https://huggingface.co/favicon.ico",
+            "quiet": True
+        })
+    else:
+        # For local development, enable sharing
+        launch_kwargs["share"] = True
+    
+    # Launch the interface
+    demo.launch(**launch_kwargs)
