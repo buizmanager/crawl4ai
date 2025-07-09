@@ -1,0 +1,53 @@
+# Use Python 3.10 slim image for better compatibility
+FROM python:3.10-slim
+
+# Set working directory
+WORKDIR /home/user
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies (minimal set)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    wget \
+    git \
+    ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create user (HF Spaces runs as user 1000)
+RUN useradd -m -u 1000 user
+USER user
+
+# Copy requirements and install Python dependencies
+COPY --chown=user requirements_hf.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install additional packages for HTTP fallback
+RUN pip install --no-cache-dir requests beautifulsoup4 html2text
+
+# Try to install Crawl4AI (but don't fail if it doesn't work)
+RUN pip install --no-cache-dir crawl4ai || echo "Crawl4AI installation failed, will use HTTP fallback"
+
+# Try to install Playwright (optional)
+RUN pip install --no-cache-dir playwright || echo "Playwright installation failed"
+
+# Try to install browsers (optional, don't fail build)
+RUN python -m playwright install chromium 2>/dev/null || echo "Browser installation skipped"
+
+# Copy application files
+COPY --chown=user app_lean_robust.py app.py
+COPY --chown=user README_HF.md README.md
+
+# Expose port
+EXPOSE 7860
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:7860/ || exit 1
+
+# Simple startup - just run the app
+CMD ["python", "app.py"]
