@@ -46,6 +46,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
     fonts-liberation \
     libappindicator3-1 \
+    # Remove duplicates and add missing deps
+    fonts-liberation \
+    libappindicator1 \
     libasound2 \
     libatk-bridge2.0-0 \
     libdrm2 \
@@ -54,8 +57,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrandr2 \
     libgbm1 \
     libxss1 \
-    libgtkextra-dev \
-    libgconf2-dev \
+    # Additional Chromium system dependencies
+    libgconf-2-4 \
+    libxfixes3 \
+    libxi6 \
+    libxrender1 \
+    libxtst6 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

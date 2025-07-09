@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Crawl4AI Gradio Interface for Hugging Face Spaces
-A simplified version of Crawl4AI that works within HF Spaces constraints
+Crawl4AI Gradio Interface for Hugging Face Spaces - Robust Version
+This version handles browser installation issues more gracefully
 """
 
 import gradio as gr
@@ -25,8 +25,8 @@ try:
 except ImportError:
     print("nest_asyncio not available, using standard asyncio")
 
-def ensure_browser_installation():
-    """Ensure Playwright browsers are installed"""
+def check_browser_availability():
+    """Check if Playwright browsers are available without trying to install"""
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
@@ -35,41 +35,38 @@ def ensure_browser_installation():
             return True
     except Exception as e:
         print(f"Browser check failed: {e}")
-        print("Installing Playwright browsers (without system deps)...")
-        try:
-            # Only install browser binaries, not system dependencies
-            # System deps should already be installed in Dockerfile
-            result = subprocess.run([
-                sys.executable, "-m", "playwright", "install", "chromium"
-            ], capture_output=True, text=True, timeout=300)
-            
-            if result.returncode == 0:
-                print("✅ Browsers installed successfully")
-                # Verify installation worked
-                try:
-                    from playwright.sync_api import sync_playwright
-                    with sync_playwright() as p:
-                        browser = p.chromium.launch(headless=True)
-                        browser.close()
-                        return True
-                except Exception as verify_error:
-                    print(f"⚠️ Browser verification failed after install: {verify_error}")
-                    return False
-            else:
-                print(f"❌ Browser installation failed: {result.stderr}")
-                return False
-        except subprocess.TimeoutExpired:
-            print("❌ Browser installation timed out")
-            return False
-        except Exception as install_error:
-            print(f"❌ Browser installation error: {install_error}")
-            return False
+        return False
 
-# Ensure browsers are installed at startup
-print("🔄 Checking browser installation...")
-browser_ready = ensure_browser_installation()
+def try_install_browsers():
+    """Try to install browsers without system dependencies"""
+    try:
+        print("🔄 Attempting to install Playwright browsers...")
+        result = subprocess.run([
+            sys.executable, "-m", "playwright", "install", "chromium"
+        ], capture_output=True, text=True, timeout=300)
+        
+        if result.returncode == 0:
+            print("✅ Browser installation completed")
+            return check_browser_availability()
+        else:
+            print(f"⚠️ Browser installation had issues: {result.stderr}")
+            return check_browser_availability()
+    except Exception as e:
+        print(f"⚠️ Browser installation failed: {e}")
+        return False
+
+# Check browser availability at startup
+print("🔄 Checking browser availability...")
+browser_ready = check_browser_availability()
+
 if not browser_ready:
-    print("⚠️ Browser installation failed - some features may not work")
+    print("🔄 Browsers not ready, attempting installation...")
+    browser_ready = try_install_browsers()
+
+if browser_ready:
+    print("✅ Browsers are ready!")
+else:
+    print("⚠️ Browsers are not available - some features may not work")
 
 try:
     from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
@@ -85,8 +82,6 @@ except ImportError as e:
     from crawl4ai.chunking_strategy import RegexChunking
     from crawl4ai.content_filter_strategy import BM25ContentFilter
 
-# No global crawler - create fresh instance for each request to avoid event loop issues
-
 async def crawl_url(
     url: str,
     extraction_type: str = "markdown",
@@ -99,21 +94,21 @@ async def crawl_url(
     """
     Crawl a single URL and return results
     """
-    crawler = None
     try:
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
         
-        # Check browser availability before proceeding
+        # Check browser availability
         if not browser_ready:
-            print("🔄 Attempting to install browsers on-demand...")
-            if not ensure_browser_installation():
+            # Try one more time to install browsers
+            print("🔄 Final attempt to install browsers...")
+            if not try_install_browsers():
                 return {
-                    "error": "Browser installation failed. This may be due to system restrictions in the HuggingFace Spaces environment. Please try refreshing the page or contact support if the issue persists.",
-                    "traceback": "Playwright browsers are not properly installed. System dependencies should be pre-installed in the Docker image, but browser binaries may need to be downloaded at runtime."
+                    "error": "Browser installation failed. This appears to be a system-level issue in the HuggingFace Spaces environment. Please try:\n\n1. Refreshing the page\n2. Trying again in a few minutes\n3. Using a simpler URL\n\nIf the problem persists, this may be due to system restrictions in the current environment.",
+                    "traceback": "Playwright browsers could not be installed or launched. This is likely due to missing system dependencies or permission restrictions in the containerized environment."
                 }
-            
-        # Create a fresh crawler for each request
+        
+        # Create browser configuration with extensive compatibility flags
         browser_config = BrowserConfig(
             headless=True,
             text_mode=True,
@@ -125,18 +120,24 @@ async def crawl_url(
                 "--disable-web-security",
                 "--allow-insecure-localhost",
                 "--ignore-certificate-errors",
-                "--single-process",  # Important for HF Spaces
+                "--single-process",
                 "--disable-background-timer-throttling",
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding",
                 "--disable-extensions",
                 "--disable-plugins",
-                "--disable-images",  # Speed up loading
+                "--disable-images",
                 "--disable-background-networking",
                 "--disable-default-apps",
                 "--disable-sync",
                 "--metrics-recording-only",
                 "--no-first-run",
+                "--disable-ipc-flooding-protection",
+                "--disable-hang-monitor",
+                "--disable-prompt-on-repost",
+                "--disable-client-side-phishing-detection",
+                "--disable-component-update",
+                "--disable-domain-reliability",
             ]
         )
         
@@ -178,7 +179,7 @@ async def crawl_url(
                 "url": crawl_result.url,
                 "title": getattr(crawl_result, 'title', 'N/A'),
                 "markdown": crawl_result.markdown,
-                "cleaned_html": crawl_result.cleaned_html[:5000] if crawl_result.cleaned_html else "",  # Limit size
+                "cleaned_html": crawl_result.cleaned_html[:5000] if crawl_result.cleaned_html else "",
                 "links": crawl_result.links,
                 "media": crawl_result.media,
                 "metadata": crawl_result.metadata,
@@ -196,7 +197,6 @@ async def crawl_url(
             # Handle PDF
             if pdf and crawl_result.pdf:
                 response["pdf_size"] = len(crawl_result.pdf)
-                # Save PDF to temp file for download
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
                     tmp.write(crawl_result.pdf)
                     response["pdf_path"] = tmp.name
@@ -204,17 +204,24 @@ async def crawl_url(
             return response
         
     except Exception as e:
-        return {
-            "error": f"Crawling failed: {str(e)}",
-            "traceback": traceback.format_exc()
-        }
+        error_msg = str(e)
+        if "BrowserType.launch" in error_msg or "Executable doesn't exist" in error_msg:
+            return {
+                "error": "Browser launch failed. This is a known issue in some HuggingFace Spaces environments. Please try:\n\n1. Refreshing the page and trying again\n2. Using a different URL\n3. Waiting a moment and retrying\n\nThe system is attempting to recover automatically.",
+                "traceback": f"Browser launch error: {error_msg}"
+            }
+        else:
+            return {
+                "error": f"Crawling failed: {error_msg}",
+                "traceback": traceback.format_exc()
+            }
 
 def format_result(result: Dict[str, Any]) -> tuple:
     """Format the crawl result for Gradio display"""
     if "error" in result:
         error_msg = result["error"]
         if "traceback" in result:
-            error_msg += f"\n\nTraceback:\n{result['traceback']}"
+            error_msg += f"\n\nTechnical Details:\n{result['traceback']}"
         return error_msg, "", "", "", None, None
     
     # Format basic info
@@ -237,12 +244,12 @@ def format_result(result: Dict[str, Any]) -> tuple:
         
         if internal_links:
             links_info += "**Internal Links:**\n"
-            for link in internal_links[:10]:  # Limit to first 10
+            for link in internal_links[:10]:
                 links_info += f"- [{link.get('text', 'No text')}]({link.get('href', '#')})\n"
         
         if external_links:
             links_info += "\n**External Links:**\n"
-            for link in external_links[:10]:  # Limit to first 10
+            for link in external_links[:10]:
                 links_info += f"- [{link.get('text', 'No text')}]({link.get('href', '#')})\n"
     
     # Format media info
@@ -276,23 +283,24 @@ def crawl_interface(url, extraction_type, custom_prompt, word_count, css_selecto
         return "Please enter a URL", "", "", "", None, None
     
     try:
-        # Use asyncio.run for proper event loop management
         result = asyncio.run(
             crawl_url(url, extraction_type, custom_prompt, word_count, css_selector, screenshot, pdf)
         )
         
         return format_result(result)
     except Exception as e:
-        error_msg = f"Interface error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+        error_msg = f"Interface error: {str(e)}\n\nTechnical Details:\n{traceback.format_exc()}"
         return error_msg, "", "", "", None, None
 
 # Create Gradio interface
 def create_interface():
     with gr.Blocks(title="Crawl4AI - Web Crawler & Scraper", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("""
+        gr.Markdown(f"""
         # 🚀🤖 Crawl4AI: Web Crawler & Scraper
         
         Extract content, generate markdown, take screenshots, and more from any webpage!
+        
+        **Status:** {'✅ Browsers Ready' if browser_ready else '⚠️ Browser Issues Detected - Some features may not work'}
         
         **Features:**
         - 📄 Convert web pages to clean markdown
@@ -302,6 +310,12 @@ def create_interface():
         - 🎯 CSS selector targeting
         - 🤖 LLM-powered extraction
         """)
+        
+        if not browser_ready:
+            gr.Markdown("""
+            ⚠️ **Notice:** Browser installation issues detected. The system will attempt to recover automatically.
+            If you encounter errors, try refreshing the page or using simpler URLs.
+            """)
         
         with gr.Row():
             with gr.Column(scale=2):
@@ -352,6 +366,11 @@ def create_interface():
                 - **LLM**: Use with custom prompts for specific extraction
                 - **CSS Selector**: Target specific page elements
                 - **Screenshots**: Capture visual content
+                
+                ### 🔧 Troubleshooting:
+                - If you get browser errors, try refreshing the page
+                - Start with simple URLs like example.com
+                - Disable screenshots/PDFs if having issues
                 """)
         
         # Output sections
@@ -398,7 +417,7 @@ def create_interface():
             examples=[
                 ["https://docs.crawl4ai.com/first-steps/introduction", "markdown", "", 10, "", False, False],
                 ["https://news.ycombinator.com", "structured", "", 5, ".storylink", False, False],
-                ["https://example.com", "llm", "Extract the main heading and description", 10, "", True, False],
+                ["https://example.com", "llm", "Extract the main heading and description", 10, "", False, False],
             ],
             inputs=[url_input, extraction_type, custom_prompt, word_count, css_selector, screenshot_check, pdf_check]
         )

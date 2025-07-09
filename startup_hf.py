@@ -24,13 +24,14 @@ def check_browser_installation():
         return False
 
 def install_browsers():
-    """Install Playwright browsers"""
+    """Install Playwright browsers (binaries only, system deps should be pre-installed)"""
     try:
         print("🔄 Installing Playwright browsers...")
         
-        # Install browsers with system dependencies
+        # Install only browser binaries, not system dependencies
+        # System dependencies should already be installed in the Docker image
         result = subprocess.run([
-            sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"
+            sys.executable, "-m", "playwright", "install", "chromium"
         ], capture_output=True, text=True, timeout=300)
         
         if result.returncode == 0:
@@ -38,6 +39,9 @@ def install_browsers():
             return True
         else:
             print(f"❌ Browser installation failed: {result.stderr}")
+            # Try to provide more helpful error information
+            if "su:" in result.stderr or "authentication failed" in result.stderr:
+                print("ℹ️ Note: System dependencies should be pre-installed in Docker image")
             return False
             
     except subprocess.TimeoutExpired:
