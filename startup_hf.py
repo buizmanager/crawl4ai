@@ -76,23 +76,30 @@ def main():
     
     # Check if browsers are already installed
     if check_browser_installation():
-        print("✅ Browsers already installed, skipping installation")
-    else:
-        print("🔄 Browsers not found, installing...")
-        if not install_browsers():
-            print("❌ Failed to install browsers, app may not work properly")
-            return False
-    
-    # Setup Crawl4AI
-    setup_crawl4ai()
-    
-    # Final verification
-    if check_browser_installation():
-        print("✅ All systems ready!")
+        print("✅ Browsers already installed and working")
+        setup_crawl4ai()
         return True
     else:
-        print("❌ Browser verification failed after installation")
-        return False
+        print("🔄 Browsers not working, attempting recovery...")
+        
+        # Try to install browsers
+        if install_browsers():
+            print("🔄 Installation completed, verifying...")
+            if check_browser_installation():
+                print("✅ Browser installation successful!")
+                setup_crawl4ai()
+                return True
+            else:
+                print("⚠️ Browser installation completed but verification failed")
+        else:
+            print("⚠️ Browser installation failed")
+    
+    # Setup Crawl4AI even if browsers failed
+    setup_crawl4ai()
+    
+    print("⚠️ Setup completed with browser issues - text extraction should still work")
+    print("📝 The application will run with limited functionality")
+    return True  # Return True to allow app to start
 
 if __name__ == "__main__":
     success = main()

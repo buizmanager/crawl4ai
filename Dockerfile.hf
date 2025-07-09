@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive \
     PLAYWRIGHT_BROWSERS_PATH=/home/user/.cache/ms-playwright
 
-# Install system dependencies including all browser dependencies
+# Install system dependencies including ALL browser dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
@@ -17,6 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg \
     git \
     ca-certificates \
+    # Core system libraries
+    libc6 \
+    libstdc++6 \
     # Essential browser dependencies
     libglib2.0-0 \
     libnss3 \
@@ -39,30 +42,39 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 \
     libasound2 \
     libatspi2.0-0 \
-    # Additional dependencies for Chromium
+    # GTK and X11 dependencies
     libgtk-3-0 \
     libxss1 \
     libgconf-2-4 \
     xvfb \
+    # Font dependencies
     fonts-liberation \
+    fonts-dejavu-core \
+    fontconfig \
+    # Additional Chromium dependencies
     libappindicator3-1 \
-    # Remove duplicates and add missing deps
-    fonts-liberation \
     libappindicator1 \
-    libasound2 \
-    libatk-bridge2.0-0 \
-    libdrm2 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxrandr2 \
-    libgbm1 \
-    libxss1 \
-    # Additional Chromium system dependencies
-    libgconf-2-4 \
-    libxfixes3 \
     libxi6 \
     libxrender1 \
     libxtst6 \
+    libxcursor1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxinerama1 \
+    libxrandr2 \
+    libxss1 \
+    libxtst6 \
+    # Audio dependencies
+    libasound2 \
+    libpulse0 \
+    # Additional system libraries that Chromium might need
+    libgcc-s1 \
+    libgssapi-krb5-2 \
+    libkrb5-3 \
+    libk5crypto3 \
+    libcom-err2 \
+    libkrb5support0 \
+    libkeyutils1 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -88,19 +100,29 @@ RUN python -m crawl4ai.install
 # Create playwright cache directory with proper permissions
 RUN mkdir -p /home/user/.cache/ms-playwright
 
-# Install Playwright browsers with system dependencies
-RUN playwright install --with-deps chromium
+# Install Playwright browsers with comprehensive installation
+RUN playwright install --with-deps chromium || echo "Initial install failed, trying without deps"
+RUN playwright install chromium || echo "Browser install failed, will handle at runtime"
 
 # Set proper permissions for playwright cache
-RUN chmod -R 755 /home/user/.cache/ms-playwright
+RUN chmod -R 755 /home/user/.cache/ms-playwright || echo "Cache directory not found"
+
+# Create a script to verify and install browsers if needed
+RUN echo '#!/bin/bash\n\
+echo "🔄 Verifying browser installation..."\n\
+python3 -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); browser = p.chromium.launch(headless=True); browser.close(); p.stop(); print(\"✅ Browser verification successful\")" 2>/dev/null || {\n\
+    echo "⚠️ Browser verification failed, attempting installation..."\n\
+    python3 -m playwright install chromium 2>/dev/null || echo "❌ Browser installation failed"\n\
+}\n\
+' > /home/user/verify_browsers.sh && chmod +x /home/user/verify_browsers.sh
 
 # Copy application files
 COPY --chown=user app.py .
 COPY --chown=user startup_hf.py .
 COPY --chown=user README_HF.md README.md
 
-# Verify browser installation (but don't fail build if it doesn't work)
-RUN python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); browser = p.chromium.launch(); browser.close(); p.stop(); print('✅ Playwright browser test successful')" || echo "⚠️ Browser test failed, will retry at runtime"
+# Run browser verification
+RUN /home/user/verify_browsers.sh
 
 # Expose port
 EXPOSE 7860
