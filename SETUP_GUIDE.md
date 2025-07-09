@@ -184,6 +184,8 @@ If you're having issues with your Hugging Face Space:
    - **CORS issues**: Your Crawl4AI server might need to allow requests from your Space's domain
    - **Build failures**: Check if all dependencies are correctly specified in requirements.txt
    - **Timeout errors**: Consider upgrading your Space's hardware if operations take too long
+   - **Gradio schema errors**: If you see errors like `TypeError: argument of type 'bool' is not iterable`, make sure you're using the exact Gradio version specified in requirements.txt (4.44.1)
+   - **WebSocket protocol errors**: For non-localhost URLs, make sure to use `wss://` instead of `ws://` in your CRAWL4AI_API_URL environment variable when running in Hugging Face Spaces
 
 4. **Restart your Space**:
    - Go to the "Settings" tab
