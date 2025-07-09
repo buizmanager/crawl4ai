@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import traceback
+import subprocess
 from typing import Optional, Dict, Any
 import tempfile
 import base64
@@ -23,6 +24,38 @@ try:
     nest_asyncio.apply()
 except ImportError:
     print("nest_asyncio not available, using standard asyncio")
+
+def ensure_browser_installation():
+    """Ensure Playwright browsers are installed"""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+            return True
+    except Exception as e:
+        print(f"Browser check failed: {e}")
+        print("Installing Playwright browsers...")
+        try:
+            result = subprocess.run([
+                sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"
+            ], capture_output=True, text=True, timeout=300)
+            
+            if result.returncode == 0:
+                print("✅ Browsers installed successfully")
+                return True
+            else:
+                print(f"❌ Browser installation failed: {result.stderr}")
+                return False
+        except Exception as install_error:
+            print(f"❌ Browser installation error: {install_error}")
+            return False
+
+# Ensure browsers are installed at startup
+print("🔄 Checking browser installation...")
+browser_ready = ensure_browser_installation()
+if not browser_ready:
+    print("⚠️ Browser installation failed - some features may not work")
 
 try:
     from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
@@ -56,6 +89,15 @@ async def crawl_url(
     try:
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
+        
+        # Check browser availability before proceeding
+        if not browser_ready:
+            print("🔄 Attempting to install browsers on-demand...")
+            if not ensure_browser_installation():
+                return {
+                    "error": "Browser installation failed. Please try again or contact support.",
+                    "traceback": "Playwright browsers are not properly installed in this environment."
+                }
             
         # Create a fresh crawler for each request
         browser_config = BrowserConfig(
@@ -76,6 +118,11 @@ async def crawl_url(
                 "--disable-extensions",
                 "--disable-plugins",
                 "--disable-images",  # Speed up loading
+                "--disable-background-networking",
+                "--disable-default-apps",
+                "--disable-sync",
+                "--metrics-recording-only",
+                "--no-first-run",
             ]
         )
         

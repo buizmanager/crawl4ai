@@ -6,16 +6,18 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    PLAYWRIGHT_BROWSERS_PATH=/home/user/.cache/ms-playwright
 
-# Install system dependencies
+# Install system dependencies including all browser dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     wget \
     gnupg \
     git \
-    # Browser dependencies
+    ca-certificates \
+    # Essential browser dependencies
     libglib2.0-0 \
     libnss3 \
     libnspr4 \
@@ -37,6 +39,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 \
     libasound2 \
     libatspi2.0-0 \
+    # Additional dependencies for Chromium
+    libgtk-3-0 \
+    libxss1 \
+    libgconf-2-4 \
+    xvfb \
+    fonts-liberation \
+    libappindicator3-1 \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libxss1 \
+    libgtkextra-dev \
+    libgconf2-dev \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -59,15 +78,22 @@ RUN pip install --user crawl4ai[all]
 # Setup Crawl4AI
 RUN python -m crawl4ai.install
 
+# Create playwright cache directory with proper permissions
+RUN mkdir -p /home/user/.cache/ms-playwright
+
 # Install Playwright browsers with system dependencies
 RUN playwright install --with-deps chromium
 
-# Verify browser installation
-RUN python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); browser = p.chromium.launch(); browser.close(); p.stop(); print('✅ Playwright browser test successful')"
+# Set proper permissions for playwright cache
+RUN chmod -R 755 /home/user/.cache/ms-playwright
 
 # Copy application files
 COPY --chown=user app.py .
+COPY --chown=user startup_hf.py .
 COPY --chown=user README_HF.md README.md
+
+# Verify browser installation (but don't fail build if it doesn't work)
+RUN python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); browser = p.chromium.launch(); browser.close(); p.stop(); print('✅ Playwright browser test successful')" || echo "⚠️ Browser test failed, will retry at runtime"
 
 # Expose port
 EXPOSE 7860
@@ -76,5 +102,5 @@ EXPOSE 7860
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:7860/ || exit 1
 
-# Run the application
-CMD ["python", "app.py"]
+# Run startup script then the application
+CMD ["sh", "-c", "python startup_hf.py && python app.py"]

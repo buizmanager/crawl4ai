@@ -68,10 +68,18 @@ Capture visual content and generate downloadable files for archival purposes.
 
 This Space runs a simplified version of Crawl4AI optimized for Hugging Face Spaces constraints:
 
-- **Browser**: Headless Chromium with optimized flags
+- **Browser**: Headless Chromium with optimized flags and automatic installation
 - **Memory**: Efficient memory management for HF Spaces limits
 - **Security**: Sandboxed execution environment
 - **Performance**: Single-process mode for stability
+- **Reliability**: Automatic browser installation and recovery on startup
+
+### Browser Installation
+The Space automatically handles Playwright browser installation:
+- Browsers are installed during container build
+- Runtime verification ensures browsers are available
+- Automatic recovery if browsers are missing
+- Optimized for HuggingFace Spaces environment
 
 ## 🌟 Full Crawl4AI Features
 
