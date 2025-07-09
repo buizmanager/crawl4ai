@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Crawl4AI Gradio Interface for Hugging Face Spaces
-A simplified version of Crawl4AI that works within HF Spaces constraints
+Crawl4AI Fixed Gradio Interface for Hugging Face Spaces
+Fixed version that properly handles asyncio event loops
 """
 
 import gradio as gr
@@ -13,6 +13,9 @@ import traceback
 from typing import Optional, Dict, Any
 import tempfile
 import base64
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 # Add the current directory to Python path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -38,9 +41,24 @@ except ImportError as e:
     from crawl4ai.chunking_strategy import RegexChunking
     from crawl4ai.content_filter_strategy import BM25ContentFilter
 
-# No global crawler - create fresh instance for each request to avoid event loop issues
+# Thread-safe executor for running async functions
+executor = ThreadPoolExecutor(max_workers=2)
 
-async def crawl_url(
+def run_async_in_thread(coro):
+    """Run async function in a separate thread with its own event loop"""
+    def run_in_thread():
+        # Create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+    
+    future = executor.submit(run_in_thread)
+    return future.result(timeout=300)  # 5 minute timeout
+
+async def crawl_url_async(
     url: str,
     extraction_type: str = "markdown",
     custom_prompt: str = "",
@@ -52,12 +70,11 @@ async def crawl_url(
     """
     Crawl a single URL and return results
     """
-    crawler = None
     try:
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
             
-        # Create a fresh crawler for each request
+        # Create browser config optimized for HF Spaces
         browser_config = BrowserConfig(
             headless=True,
             text_mode=True,
@@ -75,7 +92,9 @@ async def crawl_url(
                 "--disable-renderer-backgrounding",
                 "--disable-extensions",
                 "--disable-plugins",
-                "--disable-images",  # Speed up loading
+                "--disable-images" if not screenshot else "",  # Only load images if screenshot needed
+                "--memory-pressure-off",
+                "--max_old_space_size=512",  # Limit memory usage
             ]
         )
         
@@ -85,7 +104,9 @@ async def crawl_url(
             config = CrawlerRunConfig(
                 word_count_threshold=word_count_threshold,
                 screenshot=screenshot,
-                pdf=pdf
+                pdf=pdf,
+                page_timeout=30000,  # 30 second timeout
+                delay_before_return_html=2.0,  # Wait for page to load
             )
             
             # Add CSS selector if provided
@@ -103,8 +124,11 @@ async def crawl_url(
                 # Use regex chunking for structured extraction
                 config.chunking_strategy = RegexChunking()
                 
-            # Perform crawl
-            result = await crawler.arun(url=url, config=config)
+            # Perform crawl with timeout
+            result = await asyncio.wait_for(
+                crawler.arun(url=url, config=config),
+                timeout=120  # 2 minute timeout
+            )
             
             if not result or len(result) == 0:
                 return {"error": "No results returned from crawler"}
@@ -142,9 +166,26 @@ async def crawl_url(
                     
             return response
         
+    except asyncio.TimeoutError:
+        return {
+            "error": "Crawling timed out. The website may be slow or unresponsive.",
+            "traceback": "TimeoutError: Operation timed out after 2 minutes"
+        }
     except Exception as e:
         return {
             "error": f"Crawling failed: {str(e)}",
+            "traceback": traceback.format_exc()
+        }
+
+def crawl_url(url, extraction_type, custom_prompt, word_count, css_selector, screenshot, pdf):
+    """Synchronous wrapper for the async crawl function"""
+    try:
+        return run_async_in_thread(
+            crawl_url_async(url, extraction_type, custom_prompt, word_count, css_selector, screenshot, pdf)
+        )
+    except Exception as e:
+        return {
+            "error": f"Thread execution failed: {str(e)}",
             "traceback": traceback.format_exc()
         }
 
@@ -215,11 +256,7 @@ def crawl_interface(url, extraction_type, custom_prompt, word_count, css_selecto
         return "Please enter a URL", "", "", "", None, None
     
     try:
-        # Use asyncio.run for proper event loop management
-        result = asyncio.run(
-            crawl_url(url, extraction_type, custom_prompt, word_count, css_selector, screenshot, pdf)
-        )
-        
+        result = crawl_url(url, extraction_type, custom_prompt, word_count, css_selector, screenshot, pdf)
         return format_result(result)
     except Exception as e:
         error_msg = f"Interface error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
@@ -229,7 +266,7 @@ def crawl_interface(url, extraction_type, custom_prompt, word_count, css_selecto
 def create_interface():
     with gr.Blocks(title="Crawl4AI - Web Crawler & Scraper", theme=gr.themes.Soft()) as demo:
         gr.Markdown("""
-        # 🚀🤖 Crawl4AI: Web Crawler & Scraper
+        # 🚀🤖 Crawl4AI: Web Crawler & Scraper (Fixed Version)
         
         Extract content, generate markdown, take screenshots, and more from any webpage!
         
@@ -240,6 +277,12 @@ def create_interface():
         - 🔗 Analyze links and media
         - 🎯 CSS selector targeting
         - 🤖 LLM-powered extraction
+        
+        **Fixed Issues:**
+        - ✅ Proper asyncio event loop handling
+        - ✅ Thread-safe execution
+        - ✅ Memory optimization for HF Spaces
+        - ✅ Timeout protection
         """)
         
         with gr.Row():
@@ -291,6 +334,12 @@ def create_interface():
                 - **LLM**: Use with custom prompts for specific extraction
                 - **CSS Selector**: Target specific page elements
                 - **Screenshots**: Capture visual content
+                
+                ### ⚡ Performance:
+                - Optimized for HF Spaces
+                - 2-minute timeout protection
+                - Memory-efficient browser settings
+                - Thread-safe execution
                 """)
         
         # Output sections
@@ -344,7 +393,7 @@ def create_interface():
         
         gr.Markdown("""
         ---
-        **Note**: This is a simplified version of Crawl4AI optimized for Hugging Face Spaces. 
+        **Note**: This is a fixed version of Crawl4AI optimized for Hugging Face Spaces with proper asyncio handling.
         For full features and API access, visit the [Crawl4AI GitHub repository](https://github.com/unclecode/crawl4ai).
         """)
     
