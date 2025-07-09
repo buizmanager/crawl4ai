@@ -100,29 +100,38 @@ RUN python -m crawl4ai.install
 # Create playwright cache directory with proper permissions
 RUN mkdir -p /home/user/.cache/ms-playwright
 
-# Install Playwright browsers with comprehensive installation
-RUN playwright install --with-deps chromium || echo "Initial install failed, trying without deps"
-RUN playwright install chromium || echo "Browser install failed, will handle at runtime"
+# Install Playwright browsers with comprehensive approach
+RUN python3 -m playwright install-deps chromium || echo "System deps install failed"
+RUN python3 -m playwright install chromium || echo "Browser install failed"
+
+# Verify browser installation and debug
+RUN echo "🔍 Debugging browser installation..." && \
+    ls -la /home/user/.cache/ms-playwright/ || echo "Cache directory not found" && \
+    find /home/user/.cache/ms-playwright -name "*chrome*" -o -name "*chromium*" 2>/dev/null || echo "No browser executables found"
 
 # Set proper permissions for playwright cache
-RUN chmod -R 755 /home/user/.cache/ms-playwright || echo "Cache directory not found"
-
-# Create a script to verify and install browsers if needed
-RUN echo '#!/bin/bash\n\
-echo "🔄 Verifying browser installation..."\n\
-python3 -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); browser = p.chromium.launch(headless=True); browser.close(); p.stop(); print(\"✅ Browser verification successful\")" 2>/dev/null || {\n\
-    echo "⚠️ Browser verification failed, attempting installation..."\n\
-    python3 -m playwright install chromium 2>/dev/null || echo "❌ Browser installation failed"\n\
-}\n\
-' > /home/user/verify_browsers.sh && chmod +x /home/user/verify_browsers.sh
+RUN chmod -R 755 /home/user/.cache/ms-playwright 2>/dev/null || echo "Cache directory not found"
 
 # Copy application files
-COPY --chown=user app.py .
+COPY --chown=user app_hf_final.py app.py
 COPY --chown=user startup_hf.py .
 COPY --chown=user README_HF.md README.md
 
-# Run browser verification
-RUN /home/user/verify_browsers.sh
+# Create a runtime browser installer script
+RUN echo '#!/bin/bash\n\
+echo "🔄 Runtime browser check and installation..."\n\
+echo "📁 Checking cache directory:"\n\
+ls -la /home/user/.cache/ms-playwright/ 2>/dev/null || echo "Cache directory not found"\n\
+echo "🔍 Looking for browser executables:"\n\
+find /home/user/.cache/ms-playwright -name "*chrome*" -o -name "*chromium*" 2>/dev/null || echo "No executables found"\n\
+echo "🔄 Installing browsers..."\n\
+python3 -m playwright install chromium\n\
+echo "✅ Installation complete, verifying..."\n\
+python3 -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); browser = p.chromium.launch(headless=True); browser.close(); p.stop(); print(\"✅ Browser verification successful\")" || echo "❌ Browser verification failed"\n\
+' > /home/user/install_browsers.sh && chmod +x /home/user/install_browsers.sh
+
+# Try browser verification (but don't fail build)
+RUN python3 -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); browser = p.chromium.launch(headless=True); browser.close(); p.stop(); print('✅ Build-time browser test successful')" || echo "⚠️ Build-time browser test failed, will install at runtime"
 
 # Expose port
 EXPOSE 7860
@@ -131,5 +140,5 @@ EXPOSE 7860
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:7860/ || exit 1
 
-# Run startup script then the application
-CMD ["sh", "-c", "python startup_hf.py && python app.py"]
+# Run browser installation, startup script, then the application
+CMD ["sh", "-c", "/home/user/install_browsers.sh && python startup_hf.py && python app.py"]
