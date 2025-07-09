@@ -17,13 +17,24 @@ from datetime import datetime
 import httpx
 from dotenv import load_dotenv
 import time
+import uuid
+import websockets
+from pydantic import BaseModel
 
 # Load environment variables
 load_dotenv()
 
-# MCP client imports
-from mcp.client.websocket import websocket_client
-from mcp.client.session import ClientSession
+# Custom WebSocket client implementation
+class JsonRpcRequest(BaseModel):
+    jsonrpc: str = "2.0"
+    id: str
+    method: str
+    params: Dict[str, Any]
+
+class JsonRpcResponse(BaseModel):
+    jsonrpc: str = "2.0"
+    id: str
+    result: Dict[str, Any]
 
 # Configuration
 CRAWL4AI_API_URL = os.getenv("CRAWL4AI_API_URL", "ws://localhost:11235/mcp/ws")
@@ -34,16 +45,32 @@ class Crawl4AIClient:
     
     def __init__(self, api_url: str = CRAWL4AI_API_URL):
         self.api_url = api_url
-        self.session = None
-        self.reader = None
-        self.writer = None
+        self.websocket = None
+        self.initialized = False
         
     async def connect(self):
         """Connect to the MCP WebSocket server"""
         try:
-            self.reader, self.writer = await websocket_client(self.api_url)
-            self.session = ClientSession(self.reader, self.writer)
-            await self.session.initialize()
+            self.websocket = await websockets.connect(self.api_url)
+            
+            # Initialize the connection
+            init_id = str(uuid.uuid4())
+            init_request = JsonRpcRequest(
+                id=init_id,
+                method="initialize",
+                params={
+                    "client_info": {
+                        "name": "Crawl4AI Remote Client",
+                        "version": "1.0.0"
+                    }
+                }
+            )
+            
+            await self.websocket.send(init_request.model_dump_json())
+            response = await self.websocket.recv()
+            
+            # Mark as initialized
+            self.initialized = True
             return True
         except Exception as e:
             print(f"Connection error: {str(e)}")
@@ -51,171 +78,262 @@ class Crawl4AIClient:
             
     async def disconnect(self):
         """Disconnect from the MCP WebSocket server"""
-        if self.session:
-            await self.session.aclose()
-            self.session = None
+        if self.websocket:
+            await self.websocket.close()
+            self.websocket = None
+            self.initialized = False
         
-    async def list_tools(self):
-        """List available tools from the MCP server"""
-        if not self.session:
+    async def _send_request(self, method: str, params: Dict[str, Any]):
+        """Send a request to the MCP server and get the response"""
+        if not self.websocket or not self.initialized:
             if not await self.connect():
                 return {"error": "Failed to connect to Crawl4AI server"}
         
         try:
-            tools_response = await self.session.list_tools()
-            return {"tools": [t.model_dump() for t in tools_response.tools]}
+            request_id = str(uuid.uuid4())
+            request = JsonRpcRequest(
+                id=request_id,
+                method=method,
+                params=params
+            )
+            
+            await self.websocket.send(request.model_dump_json())
+            response_text = await self.websocket.recv()
+            response = json.loads(response_text)
+            
+            return response
         except Exception as e:
-            return {"error": f"Error listing tools: {str(e)}"}
+            return {"error": f"Request error: {str(e)}"}
+        
+    async def list_tools(self):
+        """List available tools from the MCP server"""
+        response = await self._send_request("workspace/listTools", {})
+        
+        if "error" in response:
+            return response
+        
+        return {"tools": response.get("result", {}).get("tools", [])}
             
     async def crawl_url(self, url: str, css_selector: str = "", word_count_threshold: int = 5):
         """Crawl a URL using the remote Crawl4AI instance"""
-        if not self.session:
-            if not await self.connect():
-                return {"success": False, "error": "Failed to connect to Crawl4AI server"}
+        response = await self._send_request("workspace/callTool", {
+            "name": "md",
+            "arguments": {
+                "url": url,
+                "f": "fit",  # Format: fit, raw, bm25, llm
+                "q": css_selector if css_selector else None,
+                "c": str(word_count_threshold),
+            }
+        })
+        
+        if "error" in response:
+            return {
+                "success": False,
+                "error": response["error"],
+                "url": url
+            }
         
         try:
-            # Call the 'md' tool which provides markdown extraction
-            response = await self.session.call_tool(
-                "md",
-                {
-                    "url": url,
-                    "f": "fit",  # Format: fit, raw, bm25, llm
-                    "q": css_selector if css_selector else None,
-                    "c": str(word_count_threshold),
-                },
-            )
-            
-            # Parse the response
-            result = json.loads(response.content[0].text)
-            return result
+            # Parse the content from the response
+            content = response.get("result", {}).get("content", [])
+            if content and len(content) > 0:
+                result = json.loads(content[0].get("text", "{}"))
+                return result
+            else:
+                return {
+                    "success": False,
+                    "error": "No content in response",
+                    "url": url
+                }
         except Exception as e:
             traceback_str = traceback.format_exc()
             return {
                 "success": False,
-                "error": f"Error crawling URL: {str(e)}",
-                "traceback": traceback_str
+                "error": f"Error parsing response: {str(e)}",
+                "traceback": traceback_str,
+                "url": url
             }
     
     async def get_screenshot(self, url: str, wait_time: float = 1.0):
         """Get a screenshot of a URL using the remote Crawl4AI instance"""
-        if not self.session:
-            if not await self.connect():
-                return {"success": False, "error": "Failed to connect to Crawl4AI server"}
+        response = await self._send_request("workspace/callTool", {
+            "name": "screenshot",
+            "arguments": {
+                "url": url,
+                "screenshot_wait_for": wait_time,
+            }
+        })
+        
+        if "error" in response:
+            return {
+                "success": False,
+                "error": response["error"],
+                "url": url
+            }
         
         try:
-            response = await self.session.call_tool(
-                "screenshot",
-                {
-                    "url": url,
-                    "screenshot_wait_for": wait_time,
-                },
-            )
-            
-            # Parse the response
-            result = json.loads(response.content[0].text)
-            return result
+            # Parse the content from the response
+            content = response.get("result", {}).get("content", [])
+            if content and len(content) > 0:
+                result = json.loads(content[0].get("text", "{}"))
+                return result
+            else:
+                return {
+                    "success": False,
+                    "error": "No content in response",
+                    "url": url
+                }
         except Exception as e:
             return {
                 "success": False,
                 "error": f"Error getting screenshot: {str(e)}",
-                "traceback": traceback.format_exc()
+                "traceback": traceback.format_exc(),
+                "url": url
             }
     
     async def get_pdf(self, url: str):
         """Get a PDF of a URL using the remote Crawl4AI instance"""
-        if not self.session:
-            if not await self.connect():
-                return {"success": False, "error": "Failed to connect to Crawl4AI server"}
+        response = await self._send_request("workspace/callTool", {
+            "name": "pdf",
+            "arguments": {
+                "url": url,
+            }
+        })
+        
+        if "error" in response:
+            return {
+                "success": False,
+                "error": response["error"],
+                "url": url
+            }
         
         try:
-            response = await self.session.call_tool(
-                "pdf",
-                {
-                    "url": url,
-                },
-            )
-            
-            # Parse the response
-            result = json.loads(response.content[0].text)
-            return result
+            # Parse the content from the response
+            content = response.get("result", {}).get("content", [])
+            if content and len(content) > 0:
+                result = json.loads(content[0].get("text", "{}"))
+                return result
+            else:
+                return {
+                    "success": False,
+                    "error": "No content in response",
+                    "url": url
+                }
         except Exception as e:
             return {
                 "success": False,
                 "error": f"Error getting PDF: {str(e)}",
-                "traceback": traceback.format_exc()
+                "traceback": traceback.format_exc(),
+                "url": url
             }
     
     async def execute_js(self, url: str, js_code: List[str]):
         """Execute JavaScript on a URL using the remote Crawl4AI instance"""
-        if not self.session:
-            if not await self.connect():
-                return {"success": False, "error": "Failed to connect to Crawl4AI server"}
+        response = await self._send_request("workspace/callTool", {
+            "name": "execute_js",
+            "arguments": {
+                "url": url,
+                "js_code": js_code,
+            }
+        })
+        
+        if "error" in response:
+            return {
+                "success": False,
+                "error": response["error"],
+                "url": url
+            }
         
         try:
-            response = await self.session.call_tool(
-                "execute_js",
-                {
-                    "url": url,
-                    "js_code": js_code,
-                },
-            )
-            
-            # Parse the response
-            result = json.loads(response.content[0].text)
-            return result
+            # Parse the content from the response
+            content = response.get("result", {}).get("content", [])
+            if content and len(content) > 0:
+                result = json.loads(content[0].get("text", "{}"))
+                return result
+            else:
+                return {
+                    "success": False,
+                    "error": "No content in response",
+                    "url": url
+                }
         except Exception as e:
             return {
                 "success": False,
                 "error": f"Error executing JavaScript: {str(e)}",
-                "traceback": traceback.format_exc()
+                "traceback": traceback.format_exc(),
+                "url": url
             }
     
     async def get_html(self, url: str):
         """Get the HTML of a URL using the remote Crawl4AI instance"""
-        if not self.session:
-            if not await self.connect():
-                return {"success": False, "error": "Failed to connect to Crawl4AI server"}
+        response = await self._send_request("workspace/callTool", {
+            "name": "html",
+            "arguments": {
+                "url": url,
+            }
+        })
+        
+        if "error" in response:
+            return {
+                "success": False,
+                "error": response["error"],
+                "url": url
+            }
         
         try:
-            response = await self.session.call_tool(
-                "html",
-                {
-                    "url": url,
-                },
-            )
-            
-            # Parse the response
-            result = json.loads(response.content[0].text)
-            return result
+            # Parse the content from the response
+            content = response.get("result", {}).get("content", [])
+            if content and len(content) > 0:
+                result = json.loads(content[0].get("text", "{}"))
+                return result
+            else:
+                return {
+                    "success": False,
+                    "error": "No content in response",
+                    "url": url
+                }
         except Exception as e:
             return {
                 "success": False,
                 "error": f"Error getting HTML: {str(e)}",
-                "traceback": traceback.format_exc()
+                "traceback": traceback.format_exc(),
+                "url": url
             }
     
     async def ask_question(self, query: str):
         """Ask a question about Crawl4AI using the remote instance"""
-        if not self.session:
-            if not await self.connect():
-                return {"success": False, "error": "Failed to connect to Crawl4AI server"}
+        response = await self._send_request("workspace/callTool", {
+            "name": "ask",
+            "arguments": {
+                "query": query,
+            }
+        })
+        
+        if "error" in response:
+            return {
+                "success": False,
+                "error": response["error"],
+                "query": query
+            }
         
         try:
-            response = await self.session.call_tool(
-                "ask",
-                {
-                    "query": query,
-                },
-            )
-            
-            # Parse the response
-            result = json.loads(response.content[0].text)
-            return result
+            # Parse the content from the response
+            content = response.get("result", {}).get("content", [])
+            if content and len(content) > 0:
+                result = json.loads(content[0].get("text", "{}"))
+                return result
+            else:
+                return {
+                    "success": False,
+                    "error": "No content in response",
+                    "query": query
+                }
         except Exception as e:
             return {
                 "success": False,
                 "error": f"Error asking question: {str(e)}",
-                "traceback": traceback.format_exc()
+                "traceback": traceback.format_exc(),
+                "query": query
             }
 
 # Global client instance

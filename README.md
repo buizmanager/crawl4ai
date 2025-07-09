@@ -58,9 +58,9 @@ Set these in your Hugging Face Space settings:
 
 ## 🛠️ Technical Details
 
-### MCP Protocol
+### WebSocket Communication
 
-This client uses the MCP (Model Control Protocol) to communicate with the Crawl4AI server:
+This client uses WebSocket communication with JSON-RPC messages to interact with the Crawl4AI server:
 
 - **WebSocket Transport**: Real-time bidirectional communication
 - **JSON-RPC Messages**: Standardized message format
