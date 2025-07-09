@@ -59,9 +59,11 @@ RUN pip install --user crawl4ai[all]
 # Setup Crawl4AI
 RUN python -m crawl4ai.install
 
-# Install Playwright browsers
-RUN playwright install chromium
-RUN playwright install-deps chromium
+# Install Playwright browsers with system dependencies
+RUN playwright install --with-deps chromium
+
+# Verify browser installation
+RUN python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); browser = p.chromium.launch(); browser.close(); p.stop(); print('✅ Playwright browser test successful')"
 
 # Copy application files
 COPY --chown=user app.py .

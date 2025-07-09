@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Crawl4AI Fixed Gradio Interface for Hugging Face Spaces
-Fixed version that properly handles asyncio event loops
+Robust Crawl4AI Gradio Interface for Hugging Face Spaces
+Falls back to simple HTTP scraping if browser automation fails
 """
 
 import gradio as gr
@@ -27,41 +27,42 @@ try:
 except ImportError:
     print("nest_asyncio not available, using standard asyncio")
 
-def ensure_playwright_browsers():
-    """Ensure Playwright browsers are installed"""
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser_path = p.chromium.executable_path
-            if not os.path.exists(browser_path):
-                print("🔧 Installing Playwright browsers...")
-                os.system("playwright install chromium")
-                os.system("playwright install-deps chromium")
-                return True
-        return True
-    except Exception as e:
-        print(f"⚠️ Browser setup warning: {e}")
-        print("🔧 Attempting to install Playwright browsers...")
-        os.system("playwright install chromium")
-        return False
+# Simple HTTP-based fallback imports
+import requests
+from bs4 import BeautifulSoup
+import html2text
 
-# Ensure browsers are available
-ensure_playwright_browsers()
-
+# Try to import Crawl4AI with browser support
+BROWSER_AVAILABLE = False
 try:
-    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
-    from crawl4ai.extraction_strategy import LLMExtractionStrategy
-    from crawl4ai.chunking_strategy import RegexChunking
-    from crawl4ai.content_filter_strategy import BM25ContentFilter
-except ImportError as e:
-    print(f"Import error: {e}")
-    print("Installing crawl4ai...")
-    os.system("pip install crawl4ai")
-    ensure_playwright_browsers()  # Try again after install
-    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
-    from crawl4ai.extraction_strategy import LLMExtractionStrategy
-    from crawl4ai.chunking_strategy import RegexChunking
-    from crawl4ai.content_filter_strategy import BM25ContentFilter
+    def ensure_playwright_browsers():
+        """Ensure Playwright browsers are installed"""
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser_path = p.chromium.executable_path
+                if not os.path.exists(browser_path):
+                    print("🔧 Installing Playwright browsers...")
+                    os.system("playwright install chromium")
+                    return True
+            return True
+        except Exception as e:
+            print(f"⚠️ Browser setup failed: {e}")
+            return False
+
+    # Try to ensure browsers are available
+    if ensure_playwright_browsers():
+        from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+        from crawl4ai.extraction_strategy import LLMExtractionStrategy
+        from crawl4ai.chunking_strategy import RegexChunking
+        BROWSER_AVAILABLE = True
+        print("✅ Browser automation available")
+    else:
+        print("⚠️ Browser automation not available, using HTTP fallback")
+        
+except Exception as e:
+    print(f"⚠️ Crawl4AI browser mode failed: {e}")
+    print("📡 Using HTTP-based fallback mode")
 
 # Thread-safe executor for running async functions
 executor = ThreadPoolExecutor(max_workers=2)
@@ -80,7 +81,102 @@ def run_async_in_thread(coro):
     future = executor.submit(run_in_thread)
     return future.result(timeout=300)  # 5 minute timeout
 
-async def crawl_url_async(
+def simple_crawl(url: str, css_selector: str = "") -> Dict[str, Any]:
+    """Simple HTTP-based crawling fallback"""
+    try:
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+            
+        # Set up headers to mimic a real browser
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+        }
+        
+        # Make the request
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        # Parse HTML
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Extract title
+        title = soup.find('title')
+        title_text = title.get_text().strip() if title else 'No title found'
+        
+        # Apply CSS selector if provided
+        if css_selector.strip():
+            selected_elements = soup.select(css_selector.strip())
+            if selected_elements:
+                # Create new soup with selected elements
+                new_soup = BeautifulSoup('<div></div>', 'html.parser')
+                for elem in selected_elements:
+                    new_soup.div.append(elem)
+                soup = new_soup
+        
+        # Convert to markdown
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = False
+        h.body_width = 0
+        markdown_content = h.handle(str(soup))
+        
+        # Extract links
+        links = {'internal': [], 'external': []}
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            text = link.get_text().strip()
+            
+            if href.startswith('http'):
+                if url in href:
+                    links['internal'].append({'href': href, 'text': text})
+                else:
+                    links['external'].append({'href': href, 'text': text})
+            elif href.startswith('/'):
+                base_url = '/'.join(url.split('/')[:3])
+                full_url = base_url + href
+                links['internal'].append({'href': full_url, 'text': text})
+        
+        # Extract media
+        media = {'images': [], 'videos': []}
+        for img in soup.find_all('img', src=True):
+            src = img['src']
+            alt = img.get('alt', '')
+            if not src.startswith('http'):
+                base_url = '/'.join(url.split('/')[:3])
+                src = base_url + src if src.startswith('/') else url + '/' + src
+            media['images'].append({'src': src, 'alt': alt})
+            
+        for video in soup.find_all('video', src=True):
+            src = video['src']
+            if not src.startswith('http'):
+                base_url = '/'.join(url.split('/')[:3])
+                src = base_url + src if src.startswith('/') else url + '/' + src
+            media['videos'].append({'src': src})
+        
+        return {
+            'success': True,
+            'url': url,
+            'title': title_text,
+            'markdown': markdown_content,
+            'cleaned_html': str(soup)[:5000],  # Limit size
+            'links': links,
+            'media': media,
+            'metadata': {'method': 'HTTP + BeautifulSoup'},
+            'error_message': None
+        }
+        
+    except Exception as e:
+        return {
+            'success': False,
+            'error': f"Simple crawl failed: {str(e)}",
+            'traceback': traceback.format_exc()
+        }
+
+async def browser_crawl_async(
     url: str,
     extraction_type: str = "markdown",
     custom_prompt: str = "",
@@ -89,9 +185,7 @@ async def crawl_url_async(
     screenshot: bool = False,
     pdf: bool = False
 ) -> Dict[str, Any]:
-    """
-    Crawl a single URL and return results
-    """
+    """Browser-based crawling with Crawl4AI"""
     try:
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
@@ -190,24 +284,45 @@ async def crawl_url_async(
         
     except asyncio.TimeoutError:
         return {
-            "error": "Crawling timed out. The website may be slow or unresponsive.",
+            "error": "Browser crawling timed out. The website may be slow or unresponsive.",
             "traceback": "TimeoutError: Operation timed out after 2 minutes"
         }
     except Exception as e:
         return {
-            "error": f"Crawling failed: {str(e)}",
+            "error": f"Browser crawling failed: {str(e)}",
             "traceback": traceback.format_exc()
         }
 
 def crawl_url(url, extraction_type, custom_prompt, word_count, css_selector, screenshot, pdf):
-    """Synchronous wrapper for the async crawl function"""
+    """Main crawl function with fallback logic"""
     try:
-        return run_async_in_thread(
-            crawl_url_async(url, extraction_type, custom_prompt, word_count, css_selector, screenshot, pdf)
-        )
+        # Try browser-based crawling first if available
+        if BROWSER_AVAILABLE and not screenshot and not pdf:  # Skip browser for simple requests
+            try:
+                result = run_async_in_thread(
+                    browser_crawl_async(url, extraction_type, custom_prompt, word_count, css_selector, screenshot, pdf)
+                )
+                if "error" not in result:
+                    result["metadata"] = result.get("metadata", {})
+                    result["metadata"]["method"] = "Browser (Crawl4AI)"
+                    return result
+                else:
+                    print(f"Browser crawling failed: {result['error']}")
+                    print("Falling back to simple HTTP crawling...")
+            except Exception as e:
+                print(f"Browser crawling exception: {e}")
+                print("Falling back to simple HTTP crawling...")
+        
+        # Fallback to simple HTTP crawling
+        result = simple_crawl(url, css_selector)
+        if result.get("success"):
+            return result
+        else:
+            return result  # Return error from simple crawl
+            
     except Exception as e:
         return {
-            "error": f"Thread execution failed: {str(e)}",
+            "error": f"All crawling methods failed: {str(e)}",
             "traceback": traceback.format_exc()
         }
 
@@ -220,10 +335,12 @@ def format_result(result: Dict[str, Any]) -> tuple:
         return error_msg, "", "", "", None, None
     
     # Format basic info
+    method = result.get('metadata', {}).get('method', 'Unknown')
     info = f"""
 **URL:** {result.get('url', 'N/A')}
 **Title:** {result.get('title', 'N/A')}
 **Success:** {result.get('success', False)}
+**Method:** {method}
 **Error:** {result.get('error_message', 'None')}
 """
     
@@ -253,6 +370,11 @@ def format_result(result: Dict[str, Any]) -> tuple:
         images = result['media'].get('images', [])
         videos = result['media'].get('videos', [])
         media_info = f"**Images:** {len(images)}\n**Videos:** {len(videos)}\n"
+        
+        if images:
+            media_info += "\n**Images:**\n"
+            for img in images[:5]:  # Limit to first 5
+                media_info += f"- ![{img.get('alt', 'Image')}]({img.get('src', '#')})\n"
     
     # Handle screenshot
     screenshot_file = None
@@ -286,25 +408,30 @@ def crawl_interface(url, extraction_type, custom_prompt, word_count, css_selecto
 
 # Create Gradio interface
 def create_interface():
+    browser_status = "✅ Available" if BROWSER_AVAILABLE else "❌ Not Available (using HTTP fallback)"
+    
     with gr.Blocks(title="Crawl4AI - Web Crawler & Scraper", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("""
-        # 🚀🤖 Crawl4AI: Web Crawler & Scraper (Fixed Version)
+        gr.Markdown(f"""
+        # 🚀🤖 Crawl4AI: Robust Web Crawler & Scraper
         
         Extract content, generate markdown, take screenshots, and more from any webpage!
         
+        **Browser Automation Status:** {browser_status}
+        
         **Features:**
         - 📄 Convert web pages to clean markdown
-        - 🖼️ Take full-page screenshots  
+        - 🖼️ Take full-page screenshots (browser mode only)
         - 📋 Extract structured data
         - 🔗 Analyze links and media
         - 🎯 CSS selector targeting
-        - 🤖 LLM-powered extraction
+        - 🤖 LLM-powered extraction (browser mode only)
+        - 🔄 Automatic fallback to HTTP scraping
         
-        **Fixed Issues:**
-        - ✅ Proper asyncio event loop handling
+        **Robust Design:**
+        - ✅ Automatic fallback if browser fails
+        - ✅ HTTP-based scraping always works
+        - ✅ Optimized for HF Spaces constraints
         - ✅ Thread-safe execution
-        - ✅ Memory optimization for HF Spaces
-        - ✅ Timeout protection
         """)
         
         with gr.Row():
@@ -323,14 +450,23 @@ def create_interface():
                     )
                     
                 with gr.Row():
-                    screenshot_check = gr.Checkbox(label="📸 Take Screenshot", value=False)
-                    pdf_check = gr.Checkbox(label="📄 Generate PDF", value=False)
+                    screenshot_check = gr.Checkbox(
+                        label="📸 Take Screenshot", 
+                        value=False,
+                        interactive=BROWSER_AVAILABLE
+                    )
+                    pdf_check = gr.Checkbox(
+                        label="📄 Generate PDF", 
+                        value=False,
+                        interactive=BROWSER_AVAILABLE
+                    )
                 
                 with gr.Accordion("⚙️ Advanced Options", open=False):
                     custom_prompt = gr.Textbox(
-                        label="🤖 Custom LLM Prompt (for LLM extraction)",
+                        label="🤖 Custom LLM Prompt (browser mode only)",
                         placeholder="Extract all product names and prices...",
-                        lines=3
+                        lines=3,
+                        interactive=BROWSER_AVAILABLE
                     )
                     
                     word_count = gr.Slider(
@@ -349,19 +485,22 @@ def create_interface():
                 crawl_btn = gr.Button("🚀 Crawl Website", variant="primary", size="lg")
             
             with gr.Column(scale=1):
-                gr.Markdown("""
+                gr.Markdown(f"""
                 ### 💡 Tips:
                 - **Markdown**: Best for general content extraction
                 - **Structured**: Good for data analysis  
-                - **LLM**: Use with custom prompts for specific extraction
+                - **LLM**: Use with custom prompts (browser mode only)
                 - **CSS Selector**: Target specific page elements
-                - **Screenshots**: Capture visual content
+                - **Screenshots/PDF**: Require browser mode
                 
-                ### ⚡ Performance:
-                - Optimized for HF Spaces
-                - 2-minute timeout protection
-                - Memory-efficient browser settings
-                - Thread-safe execution
+                ### 🔄 Fallback System:
+                - Browser mode: Full Crawl4AI features
+                - HTTP mode: Reliable BeautifulSoup scraping
+                - Automatic fallback if browser fails
+                
+                ### ⚡ Status:
+                - Browser Mode: {browser_status}
+                - HTTP Fallback: ✅ Always Available
                 """)
         
         # Output sections
@@ -408,14 +547,14 @@ def create_interface():
             examples=[
                 ["https://docs.crawl4ai.com/first-steps/introduction", "markdown", "", 10, "", False, False],
                 ["https://news.ycombinator.com", "structured", "", 5, ".storylink", False, False],
-                ["https://example.com", "llm", "Extract the main heading and description", 10, "", True, False],
+                ["https://example.com", "markdown", "", 10, "", False, False],
             ],
             inputs=[url_input, extraction_type, custom_prompt, word_count, css_selector, screenshot_check, pdf_check]
         )
         
         gr.Markdown("""
         ---
-        **Note**: This is a fixed version of Crawl4AI optimized for Hugging Face Spaces with proper asyncio handling.
+        **Note**: This robust version automatically falls back to HTTP scraping if browser automation fails.
         For full features and API access, visit the [Crawl4AI GitHub repository](https://github.com/unclecode/crawl4ai).
         """)
     
