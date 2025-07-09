@@ -1,0 +1,7 @@
+# Simple requirements for HF Spaces - no browser dependencies
+gradio>=4.0.0
+requests>=2.25.0
+beautifulsoup4>=4.9.0
+html2text>=2020.1.16
+lxml>=4.6.0
+urllib3>=1.26.0
