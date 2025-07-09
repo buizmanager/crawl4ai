@@ -1,218 +1,314 @@
-# 🚀 Crawl4AI API Endpoints
+# Crawl4AI API Endpoints Documentation
 
-This document describes the API endpoints available through the Crawl4AI MCP server.
+This document provides detailed information about the API endpoints available in the Crawl4AI server.
 
-## 📋 MCP Protocol
+## Base URL
 
-The Crawl4AI server uses the MCP (Model Control Protocol) to expose its functionality. This protocol provides a standardized way to invoke tools and receive responses.
+All API endpoints are relative to the base URL of your Hugging Face Space:
 
-### Connection Methods
+```
+https://your-space-name.hf.space
+```
 
-- **WebSocket**: `ws://server-address:11235/mcp/ws`
-- **Server-Sent Events (SSE)**: `http://server-address:11235/mcp/sse`
+## Authentication
 
-## 🔧 Available Tools
+Currently, the API does not require authentication. However, rate limiting is applied to prevent abuse.
 
-The following tools are available through the MCP server:
+## Endpoints
 
-### 1. `md` - Markdown Extraction
+### Health Check
 
-Extracts clean, structured markdown content from a URL.
+```
+GET /health
+```
 
-**Parameters:**
-- `url` (string): The URL to extract content from
-- `f` (string, optional): Format type - "fit", "raw", "bm25", or "llm"
-- `q` (string, optional): CSS selector for targeting specific content
-- `c` (string, optional): Minimum word count threshold
+Returns the current status of the server.
 
-**Example:**
+**Response:**
+
 ```json
 {
-  "url": "https://example.com",
-  "f": "fit",
-  "q": "article.main-content",
-  "c": "5"
+  "status": "ok",
+  "timestamp": 1625097600
 }
 ```
 
-### 2. `screenshot` - Screenshot Capture
+### Convert Webpage to Markdown
 
-Captures a screenshot of a URL.
+```
+POST /md
+```
 
-**Parameters:**
-- `url` (string): The URL to capture
-- `screenshot_wait_for` (number, optional): Time to wait after page load before capturing (in seconds)
+Converts a webpage to markdown format.
 
-**Example:**
+**Request Body:**
+
 ```json
 {
   "url": "https://example.com",
-  "screenshot_wait_for": 1.0
+  "f": "main",  // Optional filter
+  "q": "search term",  // Optional query
+  "c": true  // Optional cache flag
 }
 ```
 
-### 3. `pdf` - PDF Generation
+**Response:**
 
-Generates a PDF of a URL.
+```json
+{
+  "url": "https://example.com",
+  "filter": "main",
+  "query": "search term",
+  "cache": true,
+  "markdown": "# Example Domain\n\nThis domain is...",
+  "success": true
+}
+```
 
-**Parameters:**
-- `url` (string): The URL to convert to PDF
+### Get Processed HTML
 
-**Example:**
+```
+POST /html
+```
+
+Crawls the URL and returns the processed HTML.
+
+**Request Body:**
+
 ```json
 {
   "url": "https://example.com"
 }
 ```
 
-### 4. `execute_js` - JavaScript Execution
+**Response:**
 
-Executes JavaScript code on a URL.
-
-**Parameters:**
-- `url` (string): The URL to execute JavaScript on
-- `js_code` (array of strings): JavaScript code to execute
-
-**Example:**
 ```json
 {
-  "url": "https://news.ycombinator.com/news",
-  "js_code": [
-    "await page.click('a.morelink')",
-    "await page.waitForTimeout(1000)"
-  ]
+  "html": "<!DOCTYPE html><html>...</html>",
+  "url": "https://example.com",
+  "success": true
 }
 ```
 
-### 5. `html` - HTML Retrieval
+### Capture Screenshot
 
-Retrieves the HTML content of a URL.
+```
+POST /screenshot
+```
 
-**Parameters:**
-- `url` (string): The URL to retrieve HTML from
+Captures a screenshot of the specified URL.
 
-**Example:**
+**Request Body:**
+
 ```json
 {
-  "url": "https://example.com"
+  "url": "https://example.com",
+  "screenshot_wait_for": "networkidle",  // Optional
+  "output_path": "/tmp/screenshot.png"  // Optional
 }
 ```
 
-### 6. `ask` - Question Answering
-
-Asks a question about Crawl4AI and gets an answer.
-
-**Parameters:**
-- `query` (string): The question to ask
-
-**Example:**
-```json
-{
-  "query": "How do I extract internal links when crawling a page?"
-}
-```
-
-### 7. `crawl` - Multi-URL Crawling
-
-Crawls multiple URLs and extracts content.
-
-**Parameters:**
-- `urls` (array of strings): The URLs to crawl
-- `browser_config` (object, optional): Browser configuration options
-- `crawler_config` (object, optional): Crawler configuration options
-
-**Example:**
-```json
-{
-  "urls": ["https://example.com", "https://example.org"],
-  "browser_config": {},
-  "crawler_config": {}
-}
-```
-
-## 🔌 Using the API with Python
-
-Here's an example of how to use the API with Python:
-
-```python
-import asyncio
-from mcp.client.websocket import websocket_client
-from mcp.client.session import ClientSession
-import json
-
-async def main():
-    # Connect to the MCP server
-    async with websocket_client("ws://localhost:11235/mcp/ws") as (reader, writer):
-        # Create a client session
-        async with ClientSession(reader, writer) as session:
-            # Initialize the session
-            await session.initialize()
-            
-            # List available tools
-            tools_response = await session.list_tools()
-            print("Available tools:", [t.name for t in tools_response.tools])
-            
-            # Extract markdown from a URL
-            md_response = await session.call_tool(
-                "md",
-                {
-                    "url": "https://example.com",
-                    "f": "fit",
-                    "q": None,
-                    "c": "0",
-                },
-            )
-            
-            # Parse the response
-            result = json.loads(md_response.content[0].text)
-            print("Markdown:", result['markdown'][:100], "...")
-
-# Run the async function
-asyncio.run(main())
-```
-
-## 🔍 Response Format
-
-All API responses follow a standard format:
+**Response (with output_path):**
 
 ```json
 {
   "success": true,
-  "url": "https://example.com",
-  "title": "Example Domain",
-  "markdown": "# Example Domain\n\nThis domain is...",
-  "word_count": 42,
-  "timestamp": "2023-07-09T12:34:56.789Z",
-  "links": {
-    "internal": [...],
-    "external": [...]
-  },
-  "media": {
-    "images": [...],
-    "videos": [...]
-  },
-  "metadata": {...}
+  "path": "/tmp/screenshot.png"
 }
 ```
 
-## 🛠️ Error Handling
-
-If an error occurs, the response will include:
+**Response (without output_path):**
 
 ```json
 {
-  "success": false,
-  "error": "Error message",
-  "traceback": "Detailed error traceback"
+  "success": true,
+  "screenshot": "base64-encoded-image-data"
 }
 ```
 
-## 📚 Additional Resources
+### Generate PDF
 
-- **Crawl4AI Documentation**: [docs.crawl4ai.com](https://docs.crawl4ai.com)
-- **MCP Protocol Documentation**: [mcp-sdk Documentation](https://github.com/unclecode/mcp-sdk)
-- **GitHub Repository**: [github.com/unclecode/crawl4ai](https://github.com/unclecode/crawl4ai)
+```
+POST /pdf
+```
 
----
+Generates a PDF of the specified URL.
 
-**Built with ❤️ by the Crawl4AI community**
+**Request Body:**
+
+```json
+{
+  "url": "https://example.com",
+  "output_path": "/tmp/document.pdf"  // Optional
+}
+```
+
+**Response (with output_path):**
+
+```json
+{
+  "success": true,
+  "path": "/tmp/document.pdf"
+}
+```
+
+**Response (without output_path):**
+
+```json
+{
+  "success": true,
+  "pdf": "base64-encoded-pdf-data"
+}
+```
+
+### Execute JavaScript
+
+```
+POST /execute_js
+```
+
+Executes JavaScript on the specified URL.
+
+**Request Body:**
+
+```json
+{
+  "url": "https://example.com",
+  "scripts": [
+    "document.title",
+    "Array.from(document.querySelectorAll('a')).map(a => a.href)"
+  ]
+}
+```
+
+**Response:**
+
+```json
+{
+  "url": "https://example.com",
+  "html": "<!DOCTYPE html><html>...</html>",
+  "success": true,
+  "js_execution_result": {
+    "results": [
+      "Example Domain",
+      ["https://www.iana.org/domains/example"]
+    ]
+  },
+  // ... other CrawlResult fields
+}
+```
+
+### Crawl Multiple URLs
+
+```
+POST /crawl
+```
+
+Crawls multiple URLs and returns comprehensive results.
+
+**Request Body:**
+
+```json
+{
+  "urls": ["https://example.com", "https://example.org"],
+  "browser_config": {
+    "headless": true,
+    "text_mode": true
+  },
+  "crawler_config": {
+    "simulate_user": true,
+    "extract_metadata": true
+  }
+}
+```
+
+**Response:**
+
+```json
+[
+  {
+    "url": "https://example.com",
+    "html": "<!DOCTYPE html><html>...</html>",
+    "success": true,
+    // ... other CrawlResult fields
+  },
+  {
+    "url": "https://example.org",
+    "html": "<!DOCTYPE html><html>...</html>",
+    "success": true,
+    // ... other CrawlResult fields
+  }
+]
+```
+
+## MCP Endpoints
+
+### WebSocket Endpoint
+
+```
+WebSocket /mcp/ws
+```
+
+WebSocket endpoint for MCP (Model Control Protocol).
+
+### Server-Sent Events Endpoint
+
+```
+GET /mcp/sse
+```
+
+Server-Sent Events endpoint for MCP.
+
+### Schema Endpoint
+
+```
+GET /mcp/schema
+```
+
+Returns the JSON Schema for available MCP tools and resources.
+
+**Response:**
+
+```json
+{
+  "tools": [
+    {
+      "name": "md",
+      "description": "Convert a webpage to markdown format",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "URL to crawl"
+          },
+          // ... other properties
+        },
+        "required": ["url"]
+      }
+    },
+    // ... other tools
+  ],
+  "resources": [],
+  "resource_templates": []
+}
+```
+
+## Error Handling
+
+All endpoints return appropriate HTTP status codes:
+
+- `200 OK`: Request successful
+- `400 Bad Request`: Invalid request parameters
+- `404 Not Found`: Resource not found
+- `429 Too Many Requests`: Rate limit exceeded
+- `500 Internal Server Error`: Server error
+
+Error responses include a JSON body with details:
+
+```json
+{
+  "detail": "Error message"
+}
+```

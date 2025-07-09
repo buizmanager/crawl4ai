@@ -1,913 +1,624 @@
-#!/usr/bin/env python3
 """
-Crawl4AI Remote API Client for Hugging Face Spaces
-This app connects to a remote crawl4AI instance and provides a user interface to access its API endpoints.
+Crawl4AI FastAPI Server for Hugging Face Spaces
+- Exposes API endpoints for web crawling
+- Includes MCP server endpoints
+- Configured for Hugging Face Spaces deployment
 """
 
-import gradio as gr
-import json
 import os
 import sys
-import traceback
-from typing import Dict, Any, List, Optional
-import asyncio
-import base64
-import tempfile
-from datetime import datetime
-import httpx
-from dotenv import load_dotenv
 import time
-import uuid
-import websockets
+import asyncio
+import pathlib
+from contextlib import asynccontextmanager
+from typing import Dict, List, Optional
+
+import yaml
+from fastapi import FastAPI, HTTPException, Request, Path, Query, Depends, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from redis import asyncio as aioredis
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from prometheus_fastapi_instrumentator import Instrumentator
 
-# Load environment variables
-load_dotenv()
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 
-# Check if running on Hugging Face Spaces
-IS_HF_SPACE = os.environ.get("SPACE_ID") is not None
+# Load configuration
+def load_config():
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yml")
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
 
-# Custom WebSocket client implementation
-class JsonRpcRequest(BaseModel):
-    jsonrpc: str = "2.0"
-    id: str
-    method: str
-    params: Dict[str, Any]
+config = load_config()
 
-class JsonRpcResponse(BaseModel):
-    jsonrpc: str = "2.0"
-    id: str
-    result: Dict[str, Any]
+# Set up logging
+import logging
+logging.basicConfig(
+    level=getattr(logging, config["logging"]["level"]),
+    format=config["logging"]["format"]
+)
+logger = logging.getLogger("crawl4ai")
 
-# Configuration
-default_ws_url = "ws://localhost:11235/mcp/ws"
+# Global page semaphore (hard cap)
+MAX_PAGES = config["crawler"]["pool"].get("max_pages", 20)
+GLOBAL_SEM = asyncio.Semaphore(MAX_PAGES)
 
-# In Hugging Face Spaces, we need to ensure the WebSocket URL is using wss:// if provided with ws://
-# This is because Spaces requires secure connections
-if IS_HF_SPACE:
-    crawl4ai_url = os.getenv("CRAWL4AI_API_URL", default_ws_url)
-    if crawl4ai_url.startswith("ws://") and not crawl4ai_url.startswith("ws://localhost"):
-        # Convert ws:// to wss:// for non-localhost URLs in Hugging Face Spaces
-        crawl4ai_url = "wss://" + crawl4ai_url[5:]
-    CRAWL4AI_API_URL = crawl4ai_url
-else:
-    CRAWL4AI_API_URL = os.getenv("CRAWL4AI_API_URL", default_ws_url)
+# Patch AsyncWebCrawler.arun to use the semaphore
+orig_arun = AsyncWebCrawler.arun
 
-# MCP server URL (usually the same as CRAWL4AI_API_URL)
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", CRAWL4AI_API_URL)
+async def capped_arun(self, *a, **kw):
+    async with GLOBAL_SEM:
+        return await orig_arun(self, *a, **kw)
 
-class Crawl4AIClient:
-    """Client for interacting with a remote Crawl4AI instance"""
-    
-    def __init__(self, api_url: str = CRAWL4AI_API_URL):
-        self.api_url = api_url
-        self.websocket = None
-        self.initialized = False
-        
-    async def connect(self):
-        """Connect to the MCP WebSocket server"""
-        try:
-            self.websocket = await websockets.connect(self.api_url)
-            
-            # Initialize the connection
-            init_id = str(uuid.uuid4())
-            init_request = JsonRpcRequest(
-                id=init_id,
-                method="initialize",
-                params={
-                    "client_info": {
-                        "name": "Crawl4AI Remote Client",
-                        "version": "1.0.0"
-                    }
-                }
-            )
-            
-            await self.websocket.send(init_request.model_dump_json())
-            response = await self.websocket.recv()
-            
-            # Mark as initialized
-            self.initialized = True
-            return True
-        except Exception as e:
-            print(f"Connection error: {str(e)}")
-            return False
-            
-    async def disconnect(self):
-        """Disconnect from the MCP WebSocket server"""
-        if self.websocket:
-            await self.websocket.close()
-            self.websocket = None
-            self.initialized = False
-        
-    async def _send_request(self, method: str, params: Dict[str, Any]):
-        """Send a request to the MCP server and get the response"""
-        if not self.websocket or not self.initialized:
-            if not await self.connect():
-                return {"error": "Failed to connect to Crawl4AI server"}
-        
-        try:
-            request_id = str(uuid.uuid4())
-            request = JsonRpcRequest(
-                id=request_id,
-                method=method,
-                params=params
-            )
-            
-            await self.websocket.send(request.model_dump_json())
-            response_text = await self.websocket.recv()
-            response = json.loads(response_text)
-            
-            return response
-        except Exception as e:
-            return {"error": f"Request error: {str(e)}"}
-        
-    async def list_tools(self):
-        """List available tools from the MCP server"""
-        response = await self._send_request("workspace/listTools", {})
-        
-        if "error" in response:
-            return response
-        
-        return {"tools": response.get("result", {}).get("tools", [])}
-            
-    async def crawl_url(self, url: str, css_selector: str = "", word_count_threshold: int = 5):
-        """Crawl a URL using the remote Crawl4AI instance"""
-        response = await self._send_request("workspace/callTool", {
-            "name": "md",
-            "arguments": {
-                "url": url,
-                "f": "fit",  # Format: fit, raw, bm25, llm
-                "q": css_selector if css_selector else None,
-                "c": str(word_count_threshold),
-            }
-        })
-        
-        if "error" in response:
-            return {
-                "success": False,
-                "error": response["error"],
-                "url": url
-            }
-        
-        try:
-            # Parse the content from the response
-            content = response.get("result", {}).get("content", [])
-            if content and len(content) > 0:
-                result = json.loads(content[0].get("text", "{}"))
-                return result
-            else:
-                return {
-                    "success": False,
-                    "error": "No content in response",
-                    "url": url
-                }
-        except Exception as e:
-            traceback_str = traceback.format_exc()
-            return {
-                "success": False,
-                "error": f"Error parsing response: {str(e)}",
-                "traceback": traceback_str,
-                "url": url
-            }
-    
-    async def get_screenshot(self, url: str, wait_time: float = 1.0):
-        """Get a screenshot of a URL using the remote Crawl4AI instance"""
-        response = await self._send_request("workspace/callTool", {
-            "name": "screenshot",
-            "arguments": {
-                "url": url,
-                "screenshot_wait_for": wait_time,
-            }
-        })
-        
-        if "error" in response:
-            return {
-                "success": False,
-                "error": response["error"],
-                "url": url
-            }
-        
-        try:
-            # Parse the content from the response
-            content = response.get("result", {}).get("content", [])
-            if content and len(content) > 0:
-                result = json.loads(content[0].get("text", "{}"))
-                return result
-            else:
-                return {
-                    "success": False,
-                    "error": "No content in response",
-                    "url": url
-                }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Error getting screenshot: {str(e)}",
-                "traceback": traceback.format_exc(),
-                "url": url
-            }
-    
-    async def get_pdf(self, url: str):
-        """Get a PDF of a URL using the remote Crawl4AI instance"""
-        response = await self._send_request("workspace/callTool", {
-            "name": "pdf",
-            "arguments": {
-                "url": url,
-            }
-        })
-        
-        if "error" in response:
-            return {
-                "success": False,
-                "error": response["error"],
-                "url": url
-            }
-        
-        try:
-            # Parse the content from the response
-            content = response.get("result", {}).get("content", [])
-            if content and len(content) > 0:
-                result = json.loads(content[0].get("text", "{}"))
-                return result
-            else:
-                return {
-                    "success": False,
-                    "error": "No content in response",
-                    "url": url
-                }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Error getting PDF: {str(e)}",
-                "traceback": traceback.format_exc(),
-                "url": url
-            }
-    
-    async def execute_js(self, url: str, js_code: List[str]):
-        """Execute JavaScript on a URL using the remote Crawl4AI instance"""
-        response = await self._send_request("workspace/callTool", {
-            "name": "execute_js",
-            "arguments": {
-                "url": url,
-                "js_code": js_code,
-            }
-        })
-        
-        if "error" in response:
-            return {
-                "success": False,
-                "error": response["error"],
-                "url": url
-            }
-        
-        try:
-            # Parse the content from the response
-            content = response.get("result", {}).get("content", [])
-            if content and len(content) > 0:
-                result = json.loads(content[0].get("text", "{}"))
-                return result
-            else:
-                return {
-                    "success": False,
-                    "error": "No content in response",
-                    "url": url
-                }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Error executing JavaScript: {str(e)}",
-                "traceback": traceback.format_exc(),
-                "url": url
-            }
-    
-    async def get_html(self, url: str):
-        """Get the HTML of a URL using the remote Crawl4AI instance"""
-        response = await self._send_request("workspace/callTool", {
-            "name": "html",
-            "arguments": {
-                "url": url,
-            }
-        })
-        
-        if "error" in response:
-            return {
-                "success": False,
-                "error": response["error"],
-                "url": url
-            }
-        
-        try:
-            # Parse the content from the response
-            content = response.get("result", {}).get("content", [])
-            if content and len(content) > 0:
-                result = json.loads(content[0].get("text", "{}"))
-                return result
-            else:
-                return {
-                    "success": False,
-                    "error": "No content in response",
-                    "url": url
-                }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Error getting HTML: {str(e)}",
-                "traceback": traceback.format_exc(),
-                "url": url
-            }
-    
-    async def ask_question(self, query: str):
-        """Ask a question about Crawl4AI using the remote instance"""
-        response = await self._send_request("workspace/callTool", {
-            "name": "ask",
-            "arguments": {
-                "query": query,
-            }
-        })
-        
-        if "error" in response:
-            return {
-                "success": False,
-                "error": response["error"],
-                "query": query
-            }
-        
-        try:
-            # Parse the content from the response
-            content = response.get("result", {}).get("content", [])
-            if content and len(content) > 0:
-                result = json.loads(content[0].get("text", "{}"))
-                return result
-            else:
-                return {
-                    "success": False,
-                    "error": "No content in response",
-                    "query": query
-                }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Error asking question: {str(e)}",
-                "traceback": traceback.format_exc(),
-                "query": query
-            }
+AsyncWebCrawler.arun = capped_arun
 
-# Global client instance
-client = Crawl4AIClient()
+# Create a crawler pool
+crawler_instances = {}
 
-# Gradio interface functions
-async def crawl_interface(url, css_selector, word_count, extract_links, extract_media):
-    """Gradio interface function for crawling a URL"""
-    if not url.strip():
-        return "Please enter a URL", "", "", "", ""
+async def get_crawler(browser_config=None):
+    """Get or create a crawler instance"""
+    if browser_config is None:
+        browser_config = BrowserConfig(
+            extra_args=config["crawler"]["browser"].get("extra_args", []),
+            **config["crawler"]["browser"].get("kwargs", {})
+        )
     
-    try:
-        result = await client.crawl_url(url, css_selector, word_count)
-        return format_result(result, extract_links, extract_media)
-    except Exception as e:
-        error_msg = f"Interface error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-        return error_msg, "", "", "", ""
+    key = str(browser_config.model_dump())
+    if key not in crawler_instances:
+        crawler_instances[key] = await AsyncWebCrawler.create(config=browser_config)
+    
+    return crawler_instances[key]
 
-def format_result(result: Dict[str, Any], show_links: bool, show_media: bool) -> tuple:
-    """Format the crawl result for Gradio display"""
-    if not result.get("success", False):
-        error_msg = result.get("error", "Unknown error")
-        if "traceback" in result:
-            error_msg += f"\n\nTraceback:\n{result['traceback']}"
-        return error_msg, "", "", "", ""
-    
-    # Format basic info
-    info = f"""
-**URL:** {result.get('url', 'N/A')}
-**Title:** {result.get('title', 'N/A')}
-**Success:** ✅ {result.get('success', False)}
-**Word Count:** {result.get('word_count', 0)}
-**Timestamp:** {result.get('timestamp', datetime.now().isoformat())}
-"""
-    
-    # Get markdown content
-    markdown = result.get('markdown', '')
-    
-    # Format links
-    links_info = ""
-    if show_links and result.get('links'):
-        internal_links = result['links'].get('internal', [])
-        external_links = result['links'].get('external', [])
-        links_info = f"**Internal Links:** {len(internal_links)} | **External Links:** {len(external_links)}\n\n"
-        
-        if internal_links:
-            links_info += "### 🔗 Internal Links\n"
-            for i, link in enumerate(internal_links[:20], 1):  # Limit to first 20
-                text = link.get('text', 'No text')[:100]  # Limit text length
-                href = link.get('href', '#')
-                links_info += f"{i}. [{text}]({href})\n"
-        
-        if external_links:
-            links_info += "\n### 🌐 External Links\n"
-            for i, link in enumerate(external_links[:20], 1):  # Limit to first 20
-                text = link.get('text', 'No text')[:100]  # Limit text length
-                href = link.get('href', '#')
-                links_info += f"{i}. [{text}]({href})\n"
-    
-    # Format media info
-    media_info = ""
-    if show_media and result.get('media'):
-        images = result['media'].get('images', [])
-        videos = result['media'].get('videos', [])
-        media_info = f"**Images:** {len(images)} | **Videos:** {len(videos)}\n\n"
-        
-        if images:
-            media_info += "### 🖼️ Images\n"
-            for i, img in enumerate(images[:10], 1):  # Limit to first 10
-                alt = img.get('alt', 'No alt text')[:100]
-                src = img.get('src', '#')
-                media_info += f"{i}. ![{alt}]({src})\n"
-        
-        if videos:
-            media_info += "\n### 🎥 Videos\n"
-            for i, video in enumerate(videos[:10], 1):  # Limit to first 10
-                title = video.get('title', 'No title')[:100]
-                src = video.get('src', '#')
-                media_info += f"{i}. [{title}]({src})\n"
-    
-    # Format metadata
-    metadata_info = ""
-    if result.get('metadata'):
-        metadata = result['metadata']
-        if 'description' in metadata:
-            metadata_info += f"**Description:** {metadata['description']}\n\n"
-        
-        headings = metadata.get('headings', [])
-        if headings:
-            metadata_info += "### 📋 Page Structure\n"
-            for heading in headings[:10]:  # Limit to first 10
-                level = heading.get('level', 1)
-                text = heading.get('text', '')[:100]
-                indent = "  " * (level - 1)
-                metadata_info += f"{indent}- H{level}: {text}\n"
-    
-    return info, markdown, links_info, media_info, metadata_info
+async def close_all():
+    """Close all crawler instances"""
+    for crawler in crawler_instances.values():
+        await crawler.aclose()
+    crawler_instances.clear()
 
-async def screenshot_interface(url, wait_time):
-    """Gradio interface function for getting a screenshot"""
-    if not url.strip():
-        return "Please enter a URL", None
-    
-    try:
-        result = await client.get_screenshot(url, wait_time)
-        if not result.get("success", False):
-            error_msg = result.get("error", "Unknown error")
-            if "traceback" in result:
-                error_msg += f"\n\nTraceback:\n{result['traceback']}"
-            return error_msg, None
-        
-        # Decode the base64 image
-        screenshot_data = result.get("screenshot", "")
-        if not screenshot_data:
-            return "No screenshot data returned", None
-        
-        # Save to a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-            tmp.write(base64.b64decode(screenshot_data))
-            tmp_path = tmp.name
-        
-        return f"Screenshot of {url} captured successfully", tmp_path
-    except Exception as e:
-        error_msg = f"Screenshot error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-        return error_msg, None
+async def janitor():
+    """Periodically check for idle crawlers and close them"""
+    idle_ttl = config["crawler"]["pool"].get("idle_ttl_sec", 1800)
+    while True:
+        await asyncio.sleep(300)  # Check every 5 minutes
+        # Implementation would check last usage time and close idle crawlers
 
-async def pdf_interface(url):
-    """Gradio interface function for getting a PDF"""
-    if not url.strip():
-        return "Please enter a URL", None
-    
-    try:
-        result = await client.get_pdf(url)
-        if not result.get("success", False):
-            error_msg = result.get("error", "Unknown error")
-            if "traceback" in result:
-                error_msg += f"\n\nTraceback:\n{result['traceback']}"
-            return error_msg, None
-        
-        # Decode the base64 PDF
-        pdf_data = result.get("pdf", "")
-        if not pdf_data:
-            return "No PDF data returned", None
-        
-        # Save to a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(base64.b64decode(pdf_data))
-            tmp_path = tmp.name
-        
-        return f"PDF of {url} generated successfully", tmp_path
-    except Exception as e:
-        error_msg = f"PDF error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-        return error_msg, None
+# FastAPI lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Warm up a crawler instance
+    await get_crawler(BrowserConfig(
+        extra_args=config["crawler"]["browser"].get("extra_args", []),
+        **config["crawler"]["browser"].get("kwargs", {})
+    ))
+    # Start the janitor task
+    app.state.janitor = asyncio.create_task(janitor())
+    yield
+    # Clean up
+    app.state.janitor.cancel()
+    await close_all()
 
-async def js_interface(url, js_code):
-    """Gradio interface function for executing JavaScript"""
-    if not url.strip():
-        return "Please enter a URL", ""
-    
-    if not js_code.strip():
-        return "Please enter JavaScript code", ""
-    
-    try:
-        # Split the JS code into lines
-        js_lines = [line.strip() for line in js_code.split("\n") if line.strip()]
-        
-        result = await client.execute_js(url, js_lines)
-        if not result.get("success", False):
-            error_msg = result.get("error", "Unknown error")
-            if "traceback" in result:
-                error_msg += f"\n\nTraceback:\n{result['traceback']}"
-            return error_msg, ""
-        
-        # Return the HTML result
-        html_content = result.get("html", "")
-        return f"JavaScript executed successfully on {url}", html_content
-    except Exception as e:
-        error_msg = f"JavaScript execution error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-        return error_msg, ""
+# Create FastAPI app
+app = FastAPI(
+    title=config["app"]["title"],
+    version=config["app"]["version"],
+    lifespan=lifespan,
+)
 
-async def html_interface(url):
-    """Gradio interface function for getting HTML"""
-    if not url.strip():
-        return "Please enter a URL", ""
-    
-    try:
-        result = await client.get_html(url)
-        if not result.get("success", False):
-            error_msg = result.get("error", "Unknown error")
-            if "traceback" in result:
-                error_msg += f"\n\nTraceback:\n{result['traceback']}"
-            return error_msg, ""
-        
-        # Return the HTML result
-        html_content = result.get("html", "")
-        return f"HTML retrieved successfully from {url}", html_content
-    except Exception as e:
-        error_msg = f"HTML retrieval error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-        return error_msg, ""
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-async def ask_interface(query):
-    """Gradio interface function for asking questions"""
-    if not query.strip():
-        return "Please enter a question"
-    
-    try:
-        result = await client.ask_question(query)
-        if not result.get("success", False):
-            error_msg = result.get("error", "Unknown error")
-            if "traceback" in result:
-                error_msg += f"\n\nTraceback:\n{result['traceback']}"
-            return error_msg
-        
-        # Return the answer
-        answer = result.get("answer", "No answer provided")
-        return answer
-    except Exception as e:
-        error_msg = f"Question answering error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-        return error_msg
+# Set up Redis
+redis = aioredis.from_url(f"redis://{config['redis']['host']}:{config['redis']['port']}")
 
-async def check_connection():
-    """Check connection to the Crawl4AI server"""
-    try:
-        tools = await client.list_tools()
-        if "error" in tools:
-            return f"❌ Connection failed: {tools['error']}"
-        
-        tool_names = [t["name"] for t in tools.get("tools", [])]
-        return f"✅ Connected to Crawl4AI server\nAvailable tools: {', '.join(tool_names)}"
-    except Exception as e:
-        return f"❌ Connection failed: {str(e)}"
+# Set up rate limiter
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=[config["rate_limiting"]["default_limit"]],
+    storage_uri=config["rate_limiting"]["storage_uri"],
+)
 
-# Create Gradio interface
-def create_interface():
-    with gr.Blocks(title="Crawl4AI - Remote API Client", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("""
-        # 🚀🤖 Crawl4AI: Remote API Client
-        
-        Connect to a remote Crawl4AI instance and access its API endpoints.
-        
-        **Features:**
-        - 📄 Extract clean content from any webpage
-        - 📸 Capture screenshots of websites
-        - 📑 Generate PDFs of web pages
-        - 🔍 Execute JavaScript on web pages
-        - 🌐 Retrieve raw HTML content
-        - 💬 Ask questions about Crawl4AI
-        """)
-        
-        with gr.Row():
-            with gr.Column():
-                connection_status = gr.Textbox(
-                    label="🔌 Connection Status",
-                    value="Checking connection...",
-                    interactive=False
-                )
-                
-                check_btn = gr.Button("🔄 Check Connection", variant="secondary")
-                check_btn.click(fn=check_connection, outputs=connection_status)
-        
-        with gr.Tabs() as tabs:
-            # Tab 1: Content Extraction
-            with gr.TabItem("📄 Content Extraction"):
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        url_input = gr.Textbox(
-                            label="🌐 URL to Scrape",
-                            placeholder="https://example.com or example.com",
-                            value="https://docs.crawl4ai.com/first-steps/introduction"
-                        )
-                        
-                        with gr.Row():
-                            extract_links_check = gr.Checkbox(label="🔗 Extract Links", value=True)
-                            extract_media_check = gr.Checkbox(label="🖼️ Extract Media", value=True)
-                        
-                        with gr.Accordion("⚙️ Advanced Options", open=False):
-                            css_selector = gr.Textbox(
-                                label="🎯 CSS Selector (optional)",
-                                placeholder="article, .content, #main, .post-body",
-                                info="Target specific elements on the page"
-                            )
-                            
-                            word_count = gr.Slider(
-                                minimum=0,
-                                maximum=50,
-                                value=5,
-                                step=1,
-                                label="📝 Minimum Word Count per Line",
-                                info="Filter out lines with fewer words (0 = no filter)"
-                            )
-                        
-                        crawl_btn = gr.Button("🚀 Extract Content", variant="primary", size="lg")
-                    
-                    with gr.Column(scale=1):
-                        gr.Markdown("""
-                        ### 💡 Tips:
-                        - **Remote Processing**: Content is processed by the Crawl4AI server
-                        - **CSS Selectors**: Target specific content areas
-                        - **Word Filter**: Remove short/empty lines
-                        - **Link Analysis**: Discover site structure
-                        
-                        ### 🎯 Example Selectors:
-                        - `article` - Main article content
-                        - `.content` - Elements with 'content' class
-                        - `#main` - Element with 'main' ID
-                        - `h1, h2, h3` - All headings
-                        - `.post-body p` - Paragraphs in post body
-                        """)
-                
-                # Output sections
-                with gr.Row():
-                    with gr.Column():
-                        info_output = gr.Markdown(label="ℹ️ Page Information")
-                        
-                with gr.Tabs():
-                    with gr.TabItem("📝 Markdown Content"):
-                        markdown_output = gr.Textbox(
-                            label="Extracted Markdown",
-                            lines=25,
-                            max_lines=40,
-                            show_copy_button=True,
-                            placeholder="Scraped content will appear here..."
-                        )
-                    
-                    with gr.TabItem("🔗 Links Analysis"):
-                        links_output = gr.Markdown(
-                            label="Links Found",
-                            value="Enable 'Extract Links' and scrape a page to see links here."
-                        )
-                        
-                    with gr.TabItem("🖼️ Media Elements"):
-                        media_output = gr.Markdown(
-                            label="Media Elements",
-                            value="Enable 'Extract Media' and scrape a page to see media here."
-                        )
-                        
-                    with gr.TabItem("📊 Metadata"):
-                        metadata_output = gr.Markdown(
-                            label="Page Metadata",
-                            value="Page structure and metadata will appear here."
-                        )
-                
-                # Connect the interface
-                crawl_btn.click(
-                    fn=crawl_interface,
-                    inputs=[url_input, css_selector, word_count, extract_links_check, extract_media_check],
-                    outputs=[info_output, markdown_output, links_output, media_output, metadata_output]
-                )
-            
-            # Tab 2: Screenshots
-            with gr.TabItem("📸 Screenshots"):
-                with gr.Row():
-                    with gr.Column():
-                        screenshot_url = gr.Textbox(
-                            label="🌐 URL to Screenshot",
-                            placeholder="https://example.com",
-                            value="https://docs.crawl4ai.com"
-                        )
-                        
-                        wait_time = gr.Slider(
-                            minimum=0.1,
-                            maximum=10.0,
-                            value=1.0,
-                            step=0.1,
-                            label="⏱️ Wait Time (seconds)",
-                            info="Time to wait after page load before taking screenshot"
-                        )
-                        
-                        screenshot_btn = gr.Button("📸 Capture Screenshot", variant="primary")
-                
-                with gr.Row():
-                    with gr.Column():
-                        screenshot_status = gr.Textbox(label="Status", interactive=False)
-                        screenshot_output = gr.Image(label="Screenshot", type="filepath")
-                
-                # Connect the interface
-                screenshot_btn.click(
-                    fn=screenshot_interface,
-                    inputs=[screenshot_url, wait_time],
-                    outputs=[screenshot_status, screenshot_output]
-                )
-            
-            # Tab 3: PDF Generation
-            with gr.TabItem("📑 PDF Generation"):
-                with gr.Row():
-                    with gr.Column():
-                        pdf_url = gr.Textbox(
-                            label="🌐 URL to Convert to PDF",
-                            placeholder="https://example.com",
-                            value="https://docs.crawl4ai.com"
-                        )
-                        
-                        pdf_btn = gr.Button("📑 Generate PDF", variant="primary")
-                
-                with gr.Row():
-                    with gr.Column():
-                        pdf_status = gr.Textbox(label="Status", interactive=False)
-                        pdf_output = gr.File(label="Generated PDF")
-                
-                # Connect the interface
-                pdf_btn.click(
-                    fn=pdf_interface,
-                    inputs=[pdf_url],
-                    outputs=[pdf_status, pdf_output]
-                )
-            
-            # Tab 4: JavaScript Execution
-            with gr.TabItem("🔍 JavaScript Execution"):
-                with gr.Row():
-                    with gr.Column():
-                        js_url = gr.Textbox(
-                            label="🌐 URL for JavaScript Execution",
-                            placeholder="https://example.com",
-                            value="https://news.ycombinator.com"
-                        )
-                        
-                        js_code = gr.Textbox(
-                            label="📝 JavaScript Code",
-                            placeholder="await page.click('a.morelink')\nawait page.waitForTimeout(1000)",
-                            lines=5,
-                            value="await page.click('a.morelink')\nawait page.waitForTimeout(1000)"
-                        )
-                        
-                        js_btn = gr.Button("▶️ Execute JavaScript", variant="primary")
-                
-                with gr.Row():
-                    with gr.Column():
-                        js_status = gr.Textbox(label="Status", interactive=False)
-                        js_output = gr.Textbox(
-                            label="HTML Result",
-                            lines=15,
-                            show_copy_button=True
-                        )
-                
-                # Connect the interface
-                js_btn.click(
-                    fn=js_interface,
-                    inputs=[js_url, js_code],
-                    outputs=[js_status, js_output]
-                )
-            
-            # Tab 5: HTML Retrieval
-            with gr.TabItem("🌐 HTML Retrieval"):
-                with gr.Row():
-                    with gr.Column():
-                        html_url = gr.Textbox(
-                            label="🌐 URL to Retrieve HTML",
-                            placeholder="https://example.com",
-                            value="https://docs.crawl4ai.com"
-                        )
-                        
-                        html_btn = gr.Button("🌐 Get HTML", variant="primary")
-                
-                with gr.Row():
-                    with gr.Column():
-                        html_status = gr.Textbox(label="Status", interactive=False)
-                        html_output = gr.Textbox(
-                            label="HTML Content",
-                            lines=15,
-                            show_copy_button=True
-                        )
-                
-                # Connect the interface
-                html_btn.click(
-                    fn=html_interface,
-                    inputs=[html_url],
-                    outputs=[html_status, html_output]
-                )
-            
-            # Tab 6: Ask Questions
-            with gr.TabItem("💬 Ask Questions"):
-                with gr.Row():
-                    with gr.Column():
-                        question_input = gr.Textbox(
-                            label="❓ Question about Crawl4AI",
-                            placeholder="How do I extract internal links when crawling a page?",
-                            lines=3,
-                            value="How do I extract internal links when crawling a page?"
-                        )
-                        
-                        ask_btn = gr.Button("🔍 Ask Question", variant="primary")
-                
-                with gr.Row():
-                    with gr.Column():
-                        answer_output = gr.Markdown(
-                            label="Answer",
-                            value="Ask a question to get an answer from the Crawl4AI documentation."
-                        )
-                
-                # Connect the interface
-                ask_btn.click(
-                    fn=ask_interface,
-                    inputs=[question_input],
-                    outputs=[answer_output]
-                )
-        
-        # Examples
-        with gr.Accordion("📚 Examples", open=False):
-            gr.Examples(
-                examples=[
-                    ["https://docs.crawl4ai.com/first-steps/introduction", "", 5, True, True],
-                    ["https://news.ycombinator.com", ".storylink", 3, True, False],
-                    ["https://github.com/unclecode/crawl4ai", "article, .markdown-body", 10, False, False],
-                    ["https://python.org", ".main-content", 5, True, True],
-                    ["https://example.com", "", 0, True, True],
-                ],
-                inputs=[url_input, css_selector, word_count, extract_links_check, extract_media_check],
-                label="📚 Try these examples:"
-            )
-        
-        gr.Markdown("""
-        ---
-        ### 🔧 Technical Details
-        
-        This application connects to a remote Crawl4AI instance using the MCP protocol:
-        - **WebSocket Connection**: Real-time communication with the Crawl4AI server
-        - **MCP Protocol**: Standardized messaging for tool invocation
-        - **Remote Processing**: All web crawling happens on the server
-        - **API Endpoints**: Access to all Crawl4AI features through a unified interface
-        
-        ### 🚀 Full Crawl4AI Features
-        
-        For more information about Crawl4AI:
-        - **GitHub**: [unclecode/crawl4ai](https://github.com/unclecode/crawl4ai)
-        - **Documentation**: [docs.crawl4ai.com](https://docs.crawl4ai.com)
-        - **Python Package**: `pip install crawl4ai`
-        
-        **Built with ❤️ by the Crawl4AI community**
-        """)
-        
-        # Run connection check on startup
-        demo.load(fn=check_connection, outputs=connection_status)
-    
-    return demo
+# Set up Prometheus metrics
+if config["observability"]["prometheus"]["enabled"]:
+    Instrumentator().instrument(app).expose(app)
 
-# Create and launch the interface
-if __name__ == "__main__":
-    demo = create_interface()
-    # Configure launch parameters based on environment
-    launch_kwargs = {
-        "server_name": "0.0.0.0",
-        "server_port": 7860,
-        "show_error": True,
-        "allowed_paths": ["*"],  # Allow all paths
-        "show_api": False  # Disable API documentation to avoid schema issues
+# Pydantic models for API requests
+class CrawlRequest(BaseModel):
+    urls: List[str]
+    browser_config: Optional[dict] = None
+    crawler_config: Optional[dict] = None
+
+class MarkdownRequest(BaseModel):
+    url: str
+    f: Optional[str] = None  # filter
+    q: Optional[str] = None  # query
+    c: Optional[bool] = True  # cache
+
+class HTMLRequest(BaseModel):
+    url: str
+
+class ScreenshotRequest(BaseModel):
+    url: str
+    screenshot_wait_for: Optional[str] = None
+    output_path: Optional[str] = None
+
+class PDFRequest(BaseModel):
+    url: str
+    output_path: Optional[str] = None
+
+class JSEndpointRequest(BaseModel):
+    url: str
+    scripts: List[str]
+
+class RawCode(BaseModel):
+    code: str
+
+# API endpoints
+@app.get("/")
+async def root():
+    return {
+        "message": "Welcome to Crawl4AI API",
+        "version": config["app"]["version"],
+        "docs_url": "/docs",
+        "health_check": config["observability"]["health_check"]["endpoint"]
     }
+
+@app.get(config["observability"]["health_check"]["endpoint"])
+async def health():
+    return {"status": "ok", "timestamp": time.time()}
+
+@app.post("/md")
+@limiter.limit(config["rate_limiting"]["default_limit"])
+async def get_markdown(request: Request, body: MarkdownRequest):
+    """
+    Convert a webpage to markdown format
+    """
+    if not body.url.startswith(("http://", "https://")):
+        raise HTTPException(400, "URL must be absolute and start with http/https")
     
-    # Special configuration for Hugging Face Spaces
-    if IS_HF_SPACE:
-        # In HF Spaces, we don't need to set share=True and can use specific settings
-        launch_kwargs.update({
-            "share": False,
-            "favicon_path": "https://huggingface.co/favicon.ico",
-            "quiet": True
+    try:
+        async with AsyncWebCrawler(config=BrowserConfig(
+            extra_args=config["crawler"]["browser"].get("extra_args", []),
+            **config["crawler"]["browser"].get("kwargs", {})
+        )) as crawler:
+            results = await crawler.arun(url=body.url, config=CrawlerRunConfig())
+            
+        if not results or not results[0].success:
+            raise HTTPException(500, "Failed to crawl the URL")
+            
+        markdown = results[0].markdown
+        
+        return JSONResponse({
+            "url": body.url,
+            "filter": body.f,
+            "query": body.q,
+            "cache": body.c,
+            "markdown": markdown,
+            "success": True
         })
-    else:
-        # For local development, enable sharing
-        launch_kwargs["share"] = True
+    except Exception as e:
+        logger.error(f"Error in /md endpoint: {str(e)}")
+        raise HTTPException(500, str(e))
+
+@app.post("/html")
+@limiter.limit(config["rate_limiting"]["default_limit"])
+async def generate_html(request: Request, body: HTMLRequest):
+    """
+    Crawls the URL and returns the processed HTML
+    """
+    try:
+        cfg = CrawlerRunConfig()
+        async with AsyncWebCrawler(config=BrowserConfig(
+            extra_args=config["crawler"]["browser"].get("extra_args", []),
+            **config["crawler"]["browser"].get("kwargs", {})
+        )) as crawler:
+            results = await crawler.arun(url=body.url, config=cfg)
+        
+        if not results or not results[0].success:
+            raise HTTPException(500, "Failed to crawl the URL")
+            
+        raw_html = results[0].html
+        from crawl4ai.utils import preprocess_html_for_schema
+        processed_html = preprocess_html_for_schema(raw_html)
+        
+        return JSONResponse({
+            "html": processed_html, 
+            "url": body.url, 
+            "success": True
+        })
+    except Exception as e:
+        logger.error(f"Error in /html endpoint: {str(e)}")
+        raise HTTPException(500, str(e))
+
+@app.post("/screenshot")
+@limiter.limit(config["rate_limiting"]["default_limit"])
+async def generate_screenshot(request: Request, body: ScreenshotRequest):
+    """
+    Capture a screenshot of the specified URL
+    """
+    try:
+        cfg = CrawlerRunConfig(screenshot=True, screenshot_wait_for=body.screenshot_wait_for)
+        async with AsyncWebCrawler(config=BrowserConfig(
+            extra_args=config["crawler"]["browser"].get("extra_args", []),
+            **config["crawler"]["browser"].get("kwargs", {})
+        )) as crawler:
+            results = await crawler.arun(url=body.url, config=cfg)
+        
+        if not results or not results[0].success:
+            raise HTTPException(500, "Failed to capture screenshot")
+            
+        screenshot_data = results[0].screenshot
+        
+        if body.output_path:
+            import os
+            import base64
+            abs_path = os.path.abspath(body.output_path)
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            with open(abs_path, "wb") as f:
+                f.write(base64.b64decode(screenshot_data))
+            return {"success": True, "path": abs_path}
+        
+        return {"success": True, "screenshot": screenshot_data}
+    except Exception as e:
+        logger.error(f"Error in /screenshot endpoint: {str(e)}")
+        raise HTTPException(500, str(e))
+
+@app.post("/pdf")
+@limiter.limit(config["rate_limiting"]["default_limit"])
+async def generate_pdf(request: Request, body: PDFRequest):
+    """
+    Generate a PDF of the specified URL
+    """
+    try:
+        cfg = CrawlerRunConfig(pdf=True)
+        async with AsyncWebCrawler(config=BrowserConfig(
+            extra_args=config["crawler"]["browser"].get("extra_args", []),
+            **config["crawler"]["browser"].get("kwargs", {})
+        )) as crawler:
+            results = await crawler.arun(url=body.url, config=cfg)
+        
+        if not results or not results[0].success:
+            raise HTTPException(500, "Failed to generate PDF")
+            
+        pdf_data = results[0].pdf
+        
+        if body.output_path:
+            import os
+            abs_path = os.path.abspath(body.output_path)
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            with open(abs_path, "wb") as f:
+                f.write(pdf_data)
+            return {"success": True, "path": abs_path}
+        
+        import base64
+        return {"success": True, "pdf": base64.b64encode(pdf_data).decode()}
+    except Exception as e:
+        logger.error(f"Error in /pdf endpoint: {str(e)}")
+        raise HTTPException(500, str(e))
+
+@app.post("/execute_js")
+@limiter.limit(config["rate_limiting"]["default_limit"])
+async def execute_js(request: Request, body: JSEndpointRequest):
+    """
+    Execute JavaScript on the specified URL
+    """
+    try:
+        cfg = CrawlerRunConfig(js_code=body.scripts)
+        async with AsyncWebCrawler(config=BrowserConfig(
+            extra_args=config["crawler"]["browser"].get("extra_args", []),
+            **config["crawler"]["browser"].get("kwargs", {})
+        )) as crawler:
+            results = await crawler.arun(url=body.url, config=cfg)
+        
+        if not results or not results[0].success:
+            raise HTTPException(500, "Failed to execute JavaScript")
+            
+        data = results[0].model_dump()
+        return JSONResponse(data)
+    except Exception as e:
+        logger.error(f"Error in /execute_js endpoint: {str(e)}")
+        raise HTTPException(500, str(e))
+
+@app.post("/crawl")
+@limiter.limit(config["rate_limiting"]["default_limit"])
+async def crawl(request: Request, crawl_request: CrawlRequest):
+    """
+    Crawl a list of URLs and return the results
+    """
+    if not crawl_request.urls:
+        raise HTTPException(400, "At least one URL required")
     
-    # Launch the interface
-    demo.launch(**launch_kwargs)
+    try:
+        browser_config = BrowserConfig(
+            extra_args=config["crawler"]["browser"].get("extra_args", []),
+            **config["crawler"]["browser"].get("kwargs", {})
+        )
+        if crawl_request.browser_config:
+            browser_config = BrowserConfig.parse_obj(crawl_request.browser_config)
+        
+        crawler_config = CrawlerRunConfig()
+        if crawl_request.crawler_config:
+            crawler_config = CrawlerRunConfig.parse_obj(crawl_request.crawler_config)
+        
+        results = []
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            for url in crawl_request.urls:
+                try:
+                    result = await crawler.arun(url=url, config=crawler_config)
+                    results.extend([r.model_dump() for r in result])
+                except Exception as e:
+                    results.append({
+                        "url": url,
+                        "success": False,
+                        "error_message": str(e)
+                    })
+        
+        return JSONResponse(results)
+    except Exception as e:
+        logger.error(f"Error in /crawl endpoint: {str(e)}")
+        raise HTTPException(500, str(e))
+
+# Import MCP bridge functionality
+from mcp.server.lowlevel.server import Server, NotificationOptions
+from mcp.server.models import InitializationOptions
+import mcp.types as t
+from mcp.server.sse import SseServerTransport
+import inspect
+import json
+import re
+import anyio
+import httpx
+
+# MCP decorators
+def mcp_resource(name: str = None):
+    def deco(fn):
+        fn.__mcp_kind__, fn.__mcp_name__ = "resource", name
+        return fn
+    return deco
+
+def mcp_template(name: str = None):
+    def deco(fn):
+        fn.__mcp_kind__, fn.__mcp_name__ = "template", name
+        return fn
+    return deco
+
+def mcp_tool(name: str = None):
+    def deco(fn):
+        fn.__mcp_kind__, fn.__mcp_name__ = "tool", name
+        return fn
+    return deco
+
+# Apply MCP decorators to endpoints
+get_markdown = mcp_tool("md")(get_markdown)
+generate_html = mcp_tool("html")(generate_html)
+generate_screenshot = mcp_tool("screenshot")(generate_screenshot)
+generate_pdf = mcp_tool("pdf")(generate_pdf)
+execute_js = mcp_tool("execute_js")(execute_js)
+crawl = mcp_tool("crawl")(crawl)
+
+# HTTP proxy helper for FastAPI endpoints
+def _make_http_proxy(base_url: str, route):
+    method = list(route.methods - {"HEAD", "OPTIONS"})[0]
+    async def proxy(**kwargs):
+        # Replace path parameters
+        path = route.path
+        for k, v in list(kwargs.items()):
+            placeholder = "{" + k + "}"
+            if placeholder in path:
+                path = path.replace(placeholder, str(v))
+                kwargs.pop(k)
+        url = base_url.rstrip("/") + path
+
+        async with httpx.AsyncClient() as client:
+            try:
+                r = (
+                    await client.get(url, params=kwargs)
+                    if method == "GET"
+                    else await client.request(method, url, json=kwargs)
+                )
+                r.raise_for_status()
+                return r.text if method == "GET" else r.json()
+            except httpx.HTTPStatusError as e:
+                raise HTTPException(e.response.status_code, e.response.text)
+    return proxy
+
+# Attach MCP server
+def attach_mcp(
+    app: FastAPI,
+    *,
+    base: str = "/mcp",
+    name: str = None,
+    base_url: str,
+):
+    """Attach MCP server to FastAPI app"""
+    server_name = name or app.title or "FastAPI-MCP"
+    mcp = Server(server_name)
+
+    tools = {}
+    resources = {}
+    templates = {}
+
+    # Register decorated FastAPI routes
+    for route in app.routes:
+        fn = getattr(route, "endpoint", None)
+        kind = getattr(fn, "__mcp_kind__", None)
+        if not kind:
+            continue
+
+        key = fn.__mcp_name__ or re.sub(r"[/{}}]", "_", route.path).strip("_")
+
+        if kind == "tool":
+            proxy = _make_http_proxy(base_url, route)
+            tools[key] = (proxy, fn)
+            continue
+        if kind == "resource":
+            resources[key] = fn
+        if kind == "template":
+            templates[key] = fn
+
+    # Helpers for JSON Schema
+    def _schema(model: type[BaseModel] = None) -> dict:
+        return {"type": "object"} if model is None else model.model_json_schema()
+
+    def _body_model(fn: callable) -> type[BaseModel]:
+        for p in inspect.signature(fn).parameters.values():
+            a = p.annotation
+            if inspect.isclass(a) and issubclass(a, BaseModel):
+                return a
+        return None
+
+    # MCP handlers
+    @mcp.list_tools()
+    async def _list_tools() -> List[t.Tool]:
+        out = []
+        for k, (proxy, orig_fn) in tools.items():
+            desc = getattr(orig_fn, "__mcp_description__", None) or inspect.getdoc(orig_fn) or ""
+            schema = getattr(orig_fn, "__mcp_schema__", None) or _schema(_body_model(orig_fn))
+            out.append(
+                t.Tool(name=k, description=desc, inputSchema=schema)
+            )
+        return out
+
+    @mcp.call_tool()
+    async def _call_tool(name: str, arguments: Dict = None) -> List[t.TextContent]:
+        if name not in tools:
+            raise HTTPException(404, "tool not found")
+        
+        proxy, _ = tools[name]
+        try:
+            res = await proxy(**(arguments or {}))
+        except HTTPException as exc:
+            # Map server-side errors into MCP "text/error" payloads
+            err = {"error": exc.status_code, "detail": exc.detail}
+            return [t.TextContent(type="text", text=json.dumps(err))]
+        return [t.TextContent(type="text", text=json.dumps(res, default=str))]
+
+    @mcp.list_resources()
+    async def _list_resources() -> List[t.Resource]:
+        return [
+            t.Resource(name=k, description=inspect.getdoc(f) or "", mime_type="application/json")
+            for k, f in resources.items()
+        ]
+
+    @mcp.read_resource()
+    async def _read_resource(name: str) -> List[t.TextContent]:
+        if name not in resources:
+            raise HTTPException(404, "resource not found")
+        res = resources[name]()
+        return [t.TextContent(type="text", text=json.dumps(res, default=str))]
+
+    @mcp.list_resource_templates()
+    async def _list_templates() -> List[t.ResourceTemplate]:
+        return [
+            t.ResourceTemplate(
+                name=k,
+                description=inspect.getdoc(f) or "",
+                parameters={
+                    p: {"type": "string"} for p in _path_params(app, f)
+                },
+            )
+            for k, f in templates.items()
+        ]
+
+    def _path_params(app: FastAPI, fn: callable) -> List[str]:
+        for r in app.routes:
+            if r.endpoint is fn:
+                return list(r.param_convertors.keys())
+        return []
+
+    init_opts = InitializationOptions(
+        server_name=server_name,
+        server_version="0.1.0",
+        capabilities=mcp.get_capabilities(
+            notification_options=NotificationOptions(),
+            experimental_capabilities={},
+        ),
+    )
+
+    # WebSocket transport
+    @app.websocket_route(f"{base}/ws")
+    async def _ws(ws: WebSocket):
+        await ws.accept()
+        c2s_send, c2s_recv = anyio.create_memory_object_stream(100)
+        s2c_send, s2c_recv = anyio.create_memory_object_stream(100)
+
+        from pydantic import TypeAdapter
+        from mcp.types import JSONRPCMessage
+        adapter = TypeAdapter(JSONRPCMessage)
+
+        init_done = anyio.Event()
+
+        async def srv_to_ws():
+            first = True 
+            try:
+                async for msg in s2c_recv:
+                    await ws.send_json(msg.model_dump())
+                    if first:
+                        init_done.set()
+                        first = False
+            finally:
+                # Make sure cleanup survives TaskGroup cancellation
+                with anyio.CancelScope(shield=True):
+                    with asyncio.suppress(RuntimeError):  # Idempotent close
+                        await ws.close()
+
+        async def ws_to_srv():
+            try:
+                # 1st frame is always "initialize"
+                first = adapter.validate_python(await ws.receive_json())
+                await c2s_send.send(first)
+                await init_done.wait()  # Block until server ready
+                while True:
+                    data = await ws.receive_json()
+                    await c2s_send.send(adapter.validate_python(data))
+            except WebSocketDisconnect:
+                await c2s_send.aclose()
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(mcp.run, c2s_recv, s2c_send, init_opts)
+            tg.start_soon(ws_to_srv)
+            tg.start_soon(srv_to_ws)
+
+    # SSE transport
+    sse = SseServerTransport(f"{base}/messages/")
+
+    @app.get(f"{base}/sse")
+    async def _mcp_sse(request: Request):
+        async with sse.connect_sse(
+            request.scope, request.receive, request._send  # Starlette ASGI primitives
+        ) as (read_stream, write_stream):
+            await mcp.run(read_stream, write_stream, init_opts)
+
+    # Client → server frames are POSTed here
+    app.mount(f"{base}/messages", app=sse.handle_post_message)
+
+    # Schema endpoint
+    @app.get(f"{base}/schema")
+    async def _schema_endpoint():
+        return JSONResponse({
+            "tools": [x.model_dump() for x in await _list_tools()],
+            "resources": [x.model_dump() for x in await _list_resources()],
+            "resource_templates": [x.model_dump() for x in await _list_templates()],
+        })
+
+# Attach MCP server
+base_url = f"http://localhost:{config['app']['port']}"
+attach_mcp(app, base="/mcp", name="Crawl4AI-MCP", base_url=base_url)
+
+# Run the app if executed directly
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app:app",
+        host=config["app"]["host"],
+        port=config["app"]["port"],
+        reload=config["app"]["reload"]
+    )

@@ -1,56 +1,35 @@
 #!/bin/bash
 
-# Setup script for Crawl4AI Remote API Client
+# Exit on error
+set -e
 
-# Check if Docker is installed
-if ! command -v docker &> /dev/null; then
-    echo "Docker is not installed. Please install Docker first."
-    echo "Visit https://docs.docker.com/get-docker/ for installation instructions."
-    exit 1
-fi
+echo "🚀 Setting up Crawl4AI API for Hugging Face Spaces"
 
-# Check if Docker Compose is installed
-if ! command -v docker-compose &> /dev/null; then
-    echo "Docker Compose is not installed. Please install Docker Compose first."
-    echo "Visit https://docs.docker.com/compose/install/ for installation instructions."
-    exit 1
-fi
+# Install Python dependencies
+echo "📦 Installing Python dependencies..."
+pip install -r requirements.txt
 
-# Create .env file if it doesn't exist
+# Install Playwright browsers
+echo "🎭 Installing Playwright browsers..."
+playwright install --with-deps chromium
+
+# Set up environment
+echo "🔧 Setting up environment..."
 if [ ! -f .env ]; then
-    echo "Creating .env file from .env.example..."
     cp .env.example .env
-    echo "Please edit the .env file to configure your environment variables."
+    echo "Created .env file from template. Please edit it with your API keys."
 fi
 
-# Pull the Crawl4AI Docker image
-echo "Pulling the Crawl4AI Docker image..."
-docker pull unclecode/crawl4ai:latest
+# Create necessary directories
+echo "📁 Creating necessary directories..."
+mkdir -p logs
+mkdir -p data
 
-# Build and start the containers
-echo "Building and starting the containers..."
-docker-compose up -d
+# Set permissions
+echo "🔒 Setting permissions..."
+chmod +x setup.sh
 
-# Check if the containers are running
-echo "Checking if the containers are running..."
-if docker-compose ps | grep -q "crawl4ai-server"; then
-    echo "✅ Crawl4AI server is running."
-else
-    echo "❌ Crawl4AI server failed to start. Please check the logs with 'docker-compose logs crawl4ai-server'."
-fi
-
-if docker-compose ps | grep -q "crawl4ai-client"; then
-    echo "✅ Crawl4AI client is running."
-else
-    echo "❌ Crawl4AI client failed to start. Please check the logs with 'docker-compose logs crawl4ai-client'."
-fi
-
-echo ""
-echo "Setup complete! You can access the Crawl4AI Remote API Client at:"
-echo "http://localhost:7860"
-echo ""
-echo "To stop the containers, run:"
-echo "docker-compose down"
-echo ""
-echo "To view the logs, run:"
-echo "docker-compose logs -f"
+echo "✅ Setup complete! You can now run the server with:"
+echo "   supervisord -c supervisord.conf"
+echo "   or"
+echo "   python app.py"

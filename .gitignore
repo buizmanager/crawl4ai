@@ -20,24 +20,25 @@ wheels/
 .installed.cfg
 *.egg
 
-# Environment variables
+# Environment
 .env
 .venv
 env/
 venv/
 ENV/
+env.bak/
+venv.bak/
+.llm.env
 
 # Logs
 *.log
 logs/
 
-# Temporary files
-tmp/
-temp/
-*.tmp
-
-# Docker
-.docker/
+# Cache
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
 
 # IDE
 .idea/
