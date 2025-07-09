@@ -656,35 +656,30 @@ def create_interface():
                             extraction_type = gr.Radio(
                                 choices=["markdown", "llm", "json_css", "regex"],
                                 value="markdown",
-                                label="📊 Extraction Type",
-                                info="Markdown: Clean text | LLM: AI-powered | JSON CSS: Structured | Regex: Pattern-based"
+                                label="📊 Extraction Type"
                             )
                             
                         with gr.Row():
                             screenshot_check = gr.Checkbox(
                                 label="📸 Take Screenshot", 
                                 value=False,
-                                interactive=BROWSER_AVAILABLE,
-                                info="Requires browser automation"
+                                interactive=BROWSER_AVAILABLE
                             )
                             pdf_check = gr.Checkbox(
                                 label="📄 Generate PDF", 
                                 value=False,
-                                interactive=BROWSER_AVAILABLE,
-                                info="Requires browser automation"
+                                interactive=BROWSER_AVAILABLE
                             )
                         
                         custom_prompt = gr.Textbox(
                             label="🤖 Custom Prompt/Pattern",
                             placeholder="For LLM: 'Extract all product names and prices' | For Regex: '\\d+\\.\\d+' | For JSON CSS: Use CSS selector below",
-                            lines=3,
-                            info="Used for LLM instructions, regex patterns, or JSON CSS extraction"
+                            lines=3
                         )
                         
                         css_selector = gr.Textbox(
                             label="🎯 CSS Selector (optional)",
-                            placeholder="article, .content, #main, .product-item",
-                            info="Target specific elements on the page"
+                            placeholder="article, .content, #main, .product-item"
                         )
                         
                         word_count = gr.Slider(
@@ -692,8 +687,7 @@ def create_interface():
                             maximum=200,
                             value=10,
                             step=1,
-                            label="📝 Word Count Threshold",
-                            info="Minimum words required for content blocks"
+                            label="📝 Word Count Threshold"
                         )
                         
                         crawl_btn = gr.Button("🚀 Crawl Website", variant="primary", size="lg")
@@ -739,22 +733,19 @@ def create_interface():
                         extraction_strategy = gr.Radio(
                             choices=["markdown", "llm", "json_css", "regex"],
                             value="markdown",
-                            label="📊 Extraction Strategy",
-                            info="How to extract content from the page"
+                            label="📊 Extraction Strategy"
                         )
                         
                         chunking_strategy = gr.Radio(
                             choices=["regex", "nlp", "fixed_length"],
                             value="regex",
-                            label="✂️ Chunking Strategy",
-                            info="How to split content into chunks"
+                            label="✂️ Chunking Strategy"
                         )
                         
                         content_filter = gr.Radio(
                             choices=["none", "bm25", "pruning"],
                             value="none",
-                            label="🔍 Content Filter",
-                            info="Filter content quality and relevance"
+                            label="🔍 Content Filter"
                         )
                     
                     with gr.Column():
@@ -763,8 +754,7 @@ def create_interface():
                         cache_mode = gr.Radio(
                             choices=["enabled", "disabled"],
                             value="enabled",
-                            label="💾 Cache Mode",
-                            info="Enable caching for faster repeated requests"
+                            label="💾 Cache Mode"
                         )
                         
                         delay_before_return = gr.Slider(
@@ -772,8 +762,7 @@ def create_interface():
                             maximum=10.0,
                             value=2.0,
                             step=0.5,
-                            label="⏱️ Delay Before Return (seconds)",
-                            info="Wait time for page to fully load"
+                            label="⏱️ Delay Before Return (seconds)"
                         )
                         
                         page_timeout = gr.Slider(
@@ -781,14 +770,12 @@ def create_interface():
                             maximum=120000,
                             value=30000,
                             step=5000,
-                            label="⏰ Page Timeout (milliseconds)",
-                            info="Maximum time to wait for page load"
+                            label="⏰ Page Timeout (milliseconds)"
                         )
                         
                         remove_overlay_elements = gr.Checkbox(
                             label="🚫 Remove Overlay Elements",
-                            value=True,
-                            info="Remove popups, modals, and overlay elements"
+                            value=True
                         )
                 
                 gr.Markdown("""
@@ -824,8 +811,7 @@ def create_interface():
                     label="Extracted Markdown",
                     lines=25,
                     max_lines=40,
-                    show_copy_button=True,
-                    info="Clean, LLM-ready markdown content"
+                    show_copy_button=True
                 )
             
             with gr.TabItem("🎯 Extracted Content"):
@@ -833,40 +819,23 @@ def create_interface():
                     label="Custom Extracted Content",
                     lines=20,
                     max_lines=30,
-                    show_copy_button=True,
-                    info="Results from LLM, JSON CSS, or Regex extraction"
+                    show_copy_button=True
                 )
             
             with gr.TabItem("🔗 Links Analysis"):
-                links_output = gr.Markdown(
-                    label="Links Found",
-                    info="Internal and external links with text and URLs"
-                )
+                links_output = gr.Markdown(label="Links Found")
                 
             with gr.TabItem("🖼️ Media Analysis"):
-                media_output = gr.Markdown(
-                    label="Media Elements",
-                    info="Images, videos, and audio files found on the page"
-                )
+                media_output = gr.Markdown(label="Media Elements")
             
             with gr.TabItem("📸 Screenshot"):
-                screenshot_output = gr.Image(
-                    label="Page Screenshot", 
-                    type="filepath",
-                    info="Full-page screenshot (requires browser automation)"
-                )
+                screenshot_output = gr.Image(label="Page Screenshot", type="filepath")
                 
             with gr.TabItem("📄 PDF"):
-                pdf_output = gr.File(
-                    label="Generated PDF",
-                    info="PDF version of the page (requires browser automation)"
-                )
+                pdf_output = gr.File(label="Generated PDF")
             
             with gr.TabItem("📊 Metadata"):
-                metadata_output = gr.Markdown(
-                    label="Page Metadata",
-                    info="Structured data, headings, timestamps, and technical details"
-                )
+                metadata_output = gr.Markdown(label="Page Metadata")
         
         # Connect the interface with all parameters
         crawl_btn.click(
