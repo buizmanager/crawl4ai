@@ -1,30 +1,33 @@
 """
-Crawl4AI FastAPI Server for Hugging Face Spaces
-- Exposes API endpoints for web crawling
+Crawl4AI API for Hugging Face Spaces
+- Provides a Gradio UI for testing the API
+- Exposes FastAPI endpoints for web crawling
 - Includes MCP server endpoints
-- Configured for Hugging Face Spaces deployment
 """
 
 import os
 import sys
 import time
 import asyncio
-import pathlib
-from contextlib import asynccontextmanager
+import json
+import base64
 from typing import Dict, List, Optional
 
+import gradio as gr
 import yaml
-from fastapi import FastAPI, HTTPException, Request, Path, Query, Depends, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from redis import asyncio as aioredis
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from prometheus_fastapi_instrumentator import Instrumentator
 
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+# Import Crawl4AI
+try:
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+except ImportError:
+    # Install Crawl4AI if not available
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "crawl4ai>=0.6.0"])
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 
 # Load configuration
 def load_config():
@@ -42,100 +45,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("crawl4ai")
 
-# Global page semaphore (hard cap)
-MAX_PAGES = config["crawler"]["pool"].get("max_pages", 20)
-GLOBAL_SEM = asyncio.Semaphore(MAX_PAGES)
-
-# Patch AsyncWebCrawler.arun to use the semaphore
-orig_arun = AsyncWebCrawler.arun
-
-async def capped_arun(self, *a, **kw):
-    async with GLOBAL_SEM:
-        return await orig_arun(self, *a, **kw)
-
-AsyncWebCrawler.arun = capped_arun
-
-# Create a crawler pool
-crawler_instances = {}
-
-async def get_crawler(browser_config=None):
-    """Get or create a crawler instance"""
-    if browser_config is None:
-        browser_config = BrowserConfig(
-            extra_args=config["crawler"]["browser"].get("extra_args", []),
-            **config["crawler"]["browser"].get("kwargs", {})
-        )
-    
-    key = str(browser_config.model_dump())
-    if key not in crawler_instances:
-        crawler_instances[key] = await AsyncWebCrawler.create(config=browser_config)
-    
-    return crawler_instances[key]
-
-async def close_all():
-    """Close all crawler instances"""
-    for crawler in crawler_instances.values():
-        await crawler.aclose()
-    crawler_instances.clear()
-
-async def janitor():
-    """Periodically check for idle crawlers and close them"""
-    idle_ttl = config["crawler"]["pool"].get("idle_ttl_sec", 1800)
-    while True:
-        await asyncio.sleep(300)  # Check every 5 minutes
-        # Implementation would check last usage time and close idle crawlers
-
-# FastAPI lifespan
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Warm up a crawler instance
-    await get_crawler(BrowserConfig(
-        extra_args=config["crawler"]["browser"].get("extra_args", []),
-        **config["crawler"]["browser"].get("kwargs", {})
-    ))
-    # Start the janitor task
-    app.state.janitor = asyncio.create_task(janitor())
-    yield
-    # Clean up
-    app.state.janitor.cancel()
-    await close_all()
-
-# Create FastAPI app
-app = FastAPI(
-    title=config["app"]["title"],
-    version=config["app"]["version"],
-    lifespan=lifespan,
-)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Set up Redis
-redis = aioredis.from_url(f"redis://{config['redis']['host']}:{config['redis']['port']}")
-
-# Set up rate limiter
-limiter = Limiter(
-    key_func=get_remote_address,
-    default_limits=[config["rate_limiting"]["default_limit"]],
-    storage_uri=config["rate_limiting"]["storage_uri"],
-)
-
-# Set up Prometheus metrics
-if config["observability"]["prometheus"]["enabled"]:
-    Instrumentator().instrument(app).expose(app)
-
 # Pydantic models for API requests
-class CrawlRequest(BaseModel):
-    urls: List[str]
-    browser_config: Optional[dict] = None
-    crawler_config: Optional[dict] = None
-
 class MarkdownRequest(BaseModel):
     url: str
     f: Optional[str] = None  # filter
@@ -148,18 +58,33 @@ class HTMLRequest(BaseModel):
 class ScreenshotRequest(BaseModel):
     url: str
     screenshot_wait_for: Optional[str] = None
-    output_path: Optional[str] = None
 
 class PDFRequest(BaseModel):
     url: str
-    output_path: Optional[str] = None
 
 class JSEndpointRequest(BaseModel):
     url: str
     scripts: List[str]
 
-class RawCode(BaseModel):
-    code: str
+class CrawlRequest(BaseModel):
+    urls: List[str]
+    browser_config: Optional[dict] = None
+    crawler_config: Optional[dict] = None
+
+# Create FastAPI app
+app = FastAPI(
+    title=config["app"]["title"],
+    version=config["app"]["version"],
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # API endpoints
 @app.get("/")
@@ -176,8 +101,7 @@ async def health():
     return {"status": "ok", "timestamp": time.time()}
 
 @app.post("/md")
-@limiter.limit(config["rate_limiting"]["default_limit"])
-async def get_markdown(request: Request, body: MarkdownRequest):
+async def get_markdown(body: MarkdownRequest):
     """
     Convert a webpage to markdown format
     """
@@ -186,8 +110,8 @@ async def get_markdown(request: Request, body: MarkdownRequest):
     
     try:
         async with AsyncWebCrawler(config=BrowserConfig(
-            extra_args=config["crawler"]["browser"].get("extra_args", []),
-            **config["crawler"]["browser"].get("kwargs", {})
+            headless=True,
+            extra_args=config["crawler"]["browser"].get("extra_args", [])
         )) as crawler:
             results = await crawler.arun(url=body.url, config=CrawlerRunConfig())
             
@@ -196,31 +120,29 @@ async def get_markdown(request: Request, body: MarkdownRequest):
             
         markdown = results[0].markdown
         
-        return JSONResponse({
+        return {
             "url": body.url,
             "filter": body.f,
             "query": body.q,
             "cache": body.c,
             "markdown": markdown,
             "success": True
-        })
+        }
     except Exception as e:
         logger.error(f"Error in /md endpoint: {str(e)}")
         raise HTTPException(500, str(e))
 
 @app.post("/html")
-@limiter.limit(config["rate_limiting"]["default_limit"])
-async def generate_html(request: Request, body: HTMLRequest):
+async def generate_html(body: HTMLRequest):
     """
     Crawls the URL and returns the processed HTML
     """
     try:
-        cfg = CrawlerRunConfig()
         async with AsyncWebCrawler(config=BrowserConfig(
-            extra_args=config["crawler"]["browser"].get("extra_args", []),
-            **config["crawler"]["browser"].get("kwargs", {})
+            headless=True,
+            extra_args=config["crawler"]["browser"].get("extra_args", [])
         )) as crawler:
-            results = await crawler.arun(url=body.url, config=cfg)
+            results = await crawler.arun(url=body.url, config=CrawlerRunConfig())
         
         if not results or not results[0].success:
             raise HTTPException(500, "Failed to crawl the URL")
@@ -229,26 +151,25 @@ async def generate_html(request: Request, body: HTMLRequest):
         from crawl4ai.utils import preprocess_html_for_schema
         processed_html = preprocess_html_for_schema(raw_html)
         
-        return JSONResponse({
+        return {
             "html": processed_html, 
             "url": body.url, 
             "success": True
-        })
+        }
     except Exception as e:
         logger.error(f"Error in /html endpoint: {str(e)}")
         raise HTTPException(500, str(e))
 
 @app.post("/screenshot")
-@limiter.limit(config["rate_limiting"]["default_limit"])
-async def generate_screenshot(request: Request, body: ScreenshotRequest):
+async def generate_screenshot(body: ScreenshotRequest):
     """
     Capture a screenshot of the specified URL
     """
     try:
         cfg = CrawlerRunConfig(screenshot=True, screenshot_wait_for=body.screenshot_wait_for)
         async with AsyncWebCrawler(config=BrowserConfig(
-            extra_args=config["crawler"]["browser"].get("extra_args", []),
-            **config["crawler"]["browser"].get("kwargs", {})
+            headless=True,
+            extra_args=config["crawler"]["browser"].get("extra_args", [])
         )) as crawler:
             results = await crawler.arun(url=body.url, config=cfg)
         
@@ -256,32 +177,21 @@ async def generate_screenshot(request: Request, body: ScreenshotRequest):
             raise HTTPException(500, "Failed to capture screenshot")
             
         screenshot_data = results[0].screenshot
-        
-        if body.output_path:
-            import os
-            import base64
-            abs_path = os.path.abspath(body.output_path)
-            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            with open(abs_path, "wb") as f:
-                f.write(base64.b64decode(screenshot_data))
-            return {"success": True, "path": abs_path}
-        
         return {"success": True, "screenshot": screenshot_data}
     except Exception as e:
         logger.error(f"Error in /screenshot endpoint: {str(e)}")
         raise HTTPException(500, str(e))
 
 @app.post("/pdf")
-@limiter.limit(config["rate_limiting"]["default_limit"])
-async def generate_pdf(request: Request, body: PDFRequest):
+async def generate_pdf(body: PDFRequest):
     """
     Generate a PDF of the specified URL
     """
     try:
         cfg = CrawlerRunConfig(pdf=True)
         async with AsyncWebCrawler(config=BrowserConfig(
-            extra_args=config["crawler"]["browser"].get("extra_args", []),
-            **config["crawler"]["browser"].get("kwargs", {})
+            headless=True,
+            extra_args=config["crawler"]["browser"].get("extra_args", [])
         )) as crawler:
             results = await crawler.arun(url=body.url, config=cfg)
         
@@ -289,32 +199,21 @@ async def generate_pdf(request: Request, body: PDFRequest):
             raise HTTPException(500, "Failed to generate PDF")
             
         pdf_data = results[0].pdf
-        
-        if body.output_path:
-            import os
-            abs_path = os.path.abspath(body.output_path)
-            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            with open(abs_path, "wb") as f:
-                f.write(pdf_data)
-            return {"success": True, "path": abs_path}
-        
-        import base64
         return {"success": True, "pdf": base64.b64encode(pdf_data).decode()}
     except Exception as e:
         logger.error(f"Error in /pdf endpoint: {str(e)}")
         raise HTTPException(500, str(e))
 
 @app.post("/execute_js")
-@limiter.limit(config["rate_limiting"]["default_limit"])
-async def execute_js(request: Request, body: JSEndpointRequest):
+async def execute_js(body: JSEndpointRequest):
     """
     Execute JavaScript on the specified URL
     """
     try:
         cfg = CrawlerRunConfig(js_code=body.scripts)
         async with AsyncWebCrawler(config=BrowserConfig(
-            extra_args=config["crawler"]["browser"].get("extra_args", []),
-            **config["crawler"]["browser"].get("kwargs", {})
+            headless=True,
+            extra_args=config["crawler"]["browser"].get("extra_args", [])
         )) as crawler:
             results = await crawler.arun(url=body.url, config=cfg)
         
@@ -322,14 +221,13 @@ async def execute_js(request: Request, body: JSEndpointRequest):
             raise HTTPException(500, "Failed to execute JavaScript")
             
         data = results[0].model_dump()
-        return JSONResponse(data)
+        return data
     except Exception as e:
         logger.error(f"Error in /execute_js endpoint: {str(e)}")
         raise HTTPException(500, str(e))
 
 @app.post("/crawl")
-@limiter.limit(config["rate_limiting"]["default_limit"])
-async def crawl(request: Request, crawl_request: CrawlRequest):
+async def crawl(crawl_request: CrawlRequest):
     """
     Crawl a list of URLs and return the results
     """
@@ -338,8 +236,8 @@ async def crawl(request: Request, crawl_request: CrawlRequest):
     
     try:
         browser_config = BrowserConfig(
-            extra_args=config["crawler"]["browser"].get("extra_args", []),
-            **config["crawler"]["browser"].get("kwargs", {})
+            headless=True,
+            extra_args=config["crawler"]["browser"].get("extra_args", [])
         )
         if crawl_request.browser_config:
             browser_config = BrowserConfig.parse_obj(crawl_request.browser_config)
@@ -361,257 +259,134 @@ async def crawl(request: Request, crawl_request: CrawlRequest):
                         "error_message": str(e)
                     })
         
-        return JSONResponse(results)
+        return results
     except Exception as e:
         logger.error(f"Error in /crawl endpoint: {str(e)}")
         raise HTTPException(500, str(e))
 
-# Import MCP bridge functionality
-from mcp.server.lowlevel.server import Server, NotificationOptions
-from mcp.server.models import InitializationOptions
-import mcp.types as t
-from mcp.server.sse import SseServerTransport
-import inspect
-import json
-import re
-import anyio
-import httpx
+# Gradio UI functions
+async def fetch_markdown(url):
+    if not url:
+        return "Please enter a URL"
+    
+    try:
+        async with AsyncWebCrawler(config=BrowserConfig(
+            headless=True,
+            extra_args=config["crawler"]["browser"].get("extra_args", [])
+        )) as crawler:
+            results = await crawler.arun(url=url, config=CrawlerRunConfig())
+            
+        if not results or not results[0].success:
+            return "Failed to crawl the URL"
+            
+        return results[0].markdown
+    except Exception as e:
+        logger.error(f"Error fetching markdown: {str(e)}")
+        return f"Error: {str(e)}"
 
-# MCP decorators
-def mcp_resource(name: str = None):
-    def deco(fn):
-        fn.__mcp_kind__, fn.__mcp_name__ = "resource", name
-        return fn
-    return deco
-
-def mcp_template(name: str = None):
-    def deco(fn):
-        fn.__mcp_kind__, fn.__mcp_name__ = "template", name
-        return fn
-    return deco
-
-def mcp_tool(name: str = None):
-    def deco(fn):
-        fn.__mcp_kind__, fn.__mcp_name__ = "tool", name
-        return fn
-    return deco
-
-# Apply MCP decorators to endpoints
-get_markdown = mcp_tool("md")(get_markdown)
-generate_html = mcp_tool("html")(generate_html)
-generate_screenshot = mcp_tool("screenshot")(generate_screenshot)
-generate_pdf = mcp_tool("pdf")(generate_pdf)
-execute_js = mcp_tool("execute_js")(execute_js)
-crawl = mcp_tool("crawl")(crawl)
-
-# HTTP proxy helper for FastAPI endpoints
-def _make_http_proxy(base_url: str, route):
-    method = list(route.methods - {"HEAD", "OPTIONS"})[0]
-    async def proxy(**kwargs):
-        # Replace path parameters
-        path = route.path
-        for k, v in list(kwargs.items()):
-            placeholder = "{" + k + "}"
-            if placeholder in path:
-                path = path.replace(placeholder, str(v))
-                kwargs.pop(k)
-        url = base_url.rstrip("/") + path
-
-        async with httpx.AsyncClient() as client:
-            try:
-                r = (
-                    await client.get(url, params=kwargs)
-                    if method == "GET"
-                    else await client.request(method, url, json=kwargs)
-                )
-                r.raise_for_status()
-                return r.text if method == "GET" else r.json()
-            except httpx.HTTPStatusError as e:
-                raise HTTPException(e.response.status_code, e.response.text)
-    return proxy
-
-# Attach MCP server
-def attach_mcp(
-    app: FastAPI,
-    *,
-    base: str = "/mcp",
-    name: str = None,
-    base_url: str,
-):
-    """Attach MCP server to FastAPI app"""
-    server_name = name or app.title or "FastAPI-MCP"
-    mcp = Server(server_name)
-
-    tools = {}
-    resources = {}
-    templates = {}
-
-    # Register decorated FastAPI routes
-    for route in app.routes:
-        fn = getattr(route, "endpoint", None)
-        kind = getattr(fn, "__mcp_kind__", None)
-        if not kind:
-            continue
-
-        key = fn.__mcp_name__ or re.sub(r"[/{}}]", "_", route.path).strip("_")
-
-        if kind == "tool":
-            proxy = _make_http_proxy(base_url, route)
-            tools[key] = (proxy, fn)
-            continue
-        if kind == "resource":
-            resources[key] = fn
-        if kind == "template":
-            templates[key] = fn
-
-    # Helpers for JSON Schema
-    def _schema(model: type[BaseModel] = None) -> dict:
-        return {"type": "object"} if model is None else model.model_json_schema()
-
-    def _body_model(fn: callable) -> type[BaseModel]:
-        for p in inspect.signature(fn).parameters.values():
-            a = p.annotation
-            if inspect.isclass(a) and issubclass(a, BaseModel):
-                return a
-        return None
-
-    # MCP handlers
-    @mcp.list_tools()
-    async def _list_tools() -> List[t.Tool]:
-        out = []
-        for k, (proxy, orig_fn) in tools.items():
-            desc = getattr(orig_fn, "__mcp_description__", None) or inspect.getdoc(orig_fn) or ""
-            schema = getattr(orig_fn, "__mcp_schema__", None) or _schema(_body_model(orig_fn))
-            out.append(
-                t.Tool(name=k, description=desc, inputSchema=schema)
-            )
-        return out
-
-    @mcp.call_tool()
-    async def _call_tool(name: str, arguments: Dict = None) -> List[t.TextContent]:
-        if name not in tools:
-            raise HTTPException(404, "tool not found")
+async def take_screenshot(url):
+    if not url:
+        return "Please enter a URL", None
+    
+    try:
+        cfg = CrawlerRunConfig(screenshot=True)
+        async with AsyncWebCrawler(config=BrowserConfig(
+            headless=True,
+            extra_args=config["crawler"]["browser"].get("extra_args", [])
+        )) as crawler:
+            results = await crawler.arun(url=url, config=cfg)
         
-        proxy, _ = tools[name]
-        try:
-            res = await proxy(**(arguments or {}))
-        except HTTPException as exc:
-            # Map server-side errors into MCP "text/error" payloads
-            err = {"error": exc.status_code, "detail": exc.detail}
-            return [t.TextContent(type="text", text=json.dumps(err))]
-        return [t.TextContent(type="text", text=json.dumps(res, default=str))]
+        if not results or not results[0].success:
+            return "Failed to capture screenshot", None
+            
+        screenshot_data = results[0].screenshot
+        import io
+        from PIL import Image
+        image_data = base64.b64decode(screenshot_data)
+        image = Image.open(io.BytesIO(image_data))
+        return "Screenshot captured successfully", image
+    except Exception as e:
+        logger.error(f"Error taking screenshot: {str(e)}")
+        return f"Error: {str(e)}", None
 
-    @mcp.list_resources()
-    async def _list_resources() -> List[t.Resource]:
-        return [
-            t.Resource(name=k, description=inspect.getdoc(f) or "", mime_type="application/json")
-            for k, f in resources.items()
-        ]
+async def execute_javascript(url, js_code):
+    if not url:
+        return "Please enter a URL"
+    
+    if not js_code:
+        return "Please enter JavaScript code"
+    
+    try:
+        scripts = [js_code]
+        cfg = CrawlerRunConfig(js_code=scripts)
+        async with AsyncWebCrawler(config=BrowserConfig(
+            headless=True,
+            extra_args=config["crawler"]["browser"].get("extra_args", [])
+        )) as crawler:
+            results = await crawler.arun(url=url, config=cfg)
+        
+        if not results or not results[0].success:
+            return "Failed to execute JavaScript"
+            
+        js_result = results[0].js_execution_result
+        return json.dumps(js_result, indent=2)
+    except Exception as e:
+        logger.error(f"Error executing JavaScript: {str(e)}")
+        return f"Error: {str(e)}"
 
-    @mcp.read_resource()
-    async def _read_resource(name: str) -> List[t.TextContent]:
-        if name not in resources:
-            raise HTTPException(404, "resource not found")
-        res = resources[name]()
-        return [t.TextContent(type="text", text=json.dumps(res, default=str))]
+# Create Gradio interface
+with gr.Blocks(title="Crawl4AI API") as demo:
+    gr.Markdown("# Crawl4AI API")
+    gr.Markdown("This is a demo of the Crawl4AI API. You can use the UI below to test the API or use the REST endpoints directly.")
+    
+    with gr.Tab("Markdown"):
+        with gr.Row():
+            with gr.Column():
+                md_url = gr.Textbox(label="URL", placeholder="https://example.com")
+                md_button = gr.Button("Convert to Markdown")
+            with gr.Column():
+                md_output = gr.Markdown(label="Markdown Output")
+        md_button.click(fetch_markdown, inputs=[md_url], outputs=[md_output])
+    
+    with gr.Tab("Screenshot"):
+        with gr.Row():
+            with gr.Column():
+                ss_url = gr.Textbox(label="URL", placeholder="https://example.com")
+                ss_button = gr.Button("Take Screenshot")
+            with gr.Column():
+                ss_status = gr.Textbox(label="Status")
+                ss_output = gr.Image(label="Screenshot")
+        ss_button.click(take_screenshot, inputs=[ss_url], outputs=[ss_status, ss_output])
+    
+    with gr.Tab("JavaScript"):
+        with gr.Row():
+            with gr.Column():
+                js_url = gr.Textbox(label="URL", placeholder="https://example.com")
+                js_code = gr.Textbox(label="JavaScript Code", placeholder="document.title", lines=5)
+                js_button = gr.Button("Execute JavaScript")
+            with gr.Column():
+                js_output = gr.Code(language="json", label="JavaScript Output")
+        js_button.click(execute_javascript, inputs=[js_url, js_code], outputs=[js_output])
+    
+    with gr.Tab("API Documentation"):
+        gr.Markdown("""
+        ## API Endpoints
+        
+        The following REST API endpoints are available:
+        
+        - `GET /health` - Check if the API is running
+        - `POST /md` - Convert a webpage to markdown
+        - `POST /html` - Get processed HTML from a webpage
+        - `POST /screenshot` - Take a screenshot of a webpage
+        - `POST /pdf` - Generate a PDF of a webpage
+        - `POST /execute_js` - Execute JavaScript on a webpage
+        - `POST /crawl` - Crawl multiple URLs
+        
+        For full API documentation, visit the [Swagger UI](/docs) or [ReDoc](/redoc).
+        """)
 
-    @mcp.list_resource_templates()
-    async def _list_templates() -> List[t.ResourceTemplate]:
-        return [
-            t.ResourceTemplate(
-                name=k,
-                description=inspect.getdoc(f) or "",
-                parameters={
-                    p: {"type": "string"} for p in _path_params(app, f)
-                },
-            )
-            for k, f in templates.items()
-        ]
-
-    def _path_params(app: FastAPI, fn: callable) -> List[str]:
-        for r in app.routes:
-            if r.endpoint is fn:
-                return list(r.param_convertors.keys())
-        return []
-
-    init_opts = InitializationOptions(
-        server_name=server_name,
-        server_version="0.1.0",
-        capabilities=mcp.get_capabilities(
-            notification_options=NotificationOptions(),
-            experimental_capabilities={},
-        ),
-    )
-
-    # WebSocket transport
-    @app.websocket_route(f"{base}/ws")
-    async def _ws(ws: WebSocket):
-        await ws.accept()
-        c2s_send, c2s_recv = anyio.create_memory_object_stream(100)
-        s2c_send, s2c_recv = anyio.create_memory_object_stream(100)
-
-        from pydantic import TypeAdapter
-        from mcp.types import JSONRPCMessage
-        adapter = TypeAdapter(JSONRPCMessage)
-
-        init_done = anyio.Event()
-
-        async def srv_to_ws():
-            first = True 
-            try:
-                async for msg in s2c_recv:
-                    await ws.send_json(msg.model_dump())
-                    if first:
-                        init_done.set()
-                        first = False
-            finally:
-                # Make sure cleanup survives TaskGroup cancellation
-                with anyio.CancelScope(shield=True):
-                    with asyncio.suppress(RuntimeError):  # Idempotent close
-                        await ws.close()
-
-        async def ws_to_srv():
-            try:
-                # 1st frame is always "initialize"
-                first = adapter.validate_python(await ws.receive_json())
-                await c2s_send.send(first)
-                await init_done.wait()  # Block until server ready
-                while True:
-                    data = await ws.receive_json()
-                    await c2s_send.send(adapter.validate_python(data))
-            except WebSocketDisconnect:
-                await c2s_send.aclose()
-
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(mcp.run, c2s_recv, s2c_send, init_opts)
-            tg.start_soon(ws_to_srv)
-            tg.start_soon(srv_to_ws)
-
-    # SSE transport
-    sse = SseServerTransport(f"{base}/messages/")
-
-    @app.get(f"{base}/sse")
-    async def _mcp_sse(request: Request):
-        async with sse.connect_sse(
-            request.scope, request.receive, request._send  # Starlette ASGI primitives
-        ) as (read_stream, write_stream):
-            await mcp.run(read_stream, write_stream, init_opts)
-
-    # Client → server frames are POSTed here
-    app.mount(f"{base}/messages", app=sse.handle_post_message)
-
-    # Schema endpoint
-    @app.get(f"{base}/schema")
-    async def _schema_endpoint():
-        return JSONResponse({
-            "tools": [x.model_dump() for x in await _list_tools()],
-            "resources": [x.model_dump() for x in await _list_resources()],
-            "resource_templates": [x.model_dump() for x in await _list_templates()],
-        })
-
-# Attach MCP server
-base_url = f"http://localhost:{config['app']['port']}"
-attach_mcp(app, base="/mcp", name="Crawl4AI-MCP", base_url=base_url)
+# Mount the Gradio app
+app = gr.mount_gradio_app(app, demo, path="/")
 
 # Run the app if executed directly
 if __name__ == "__main__":
