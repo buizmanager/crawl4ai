@@ -1,0 +1,131 @@
+# Use Python 3.10 slim image for better compatibility
+FROM python:3.10-slim
+
+# Set working directory
+WORKDIR /home/user
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    PLAYWRIGHT_BROWSERS_PATH=/home/user/.cache/ms-playwright
+
+# Install system dependencies for full functionality
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Basic tools
+    curl \
+    wget \
+    git \
+    ca-certificates \
+    # Build tools for Python packages
+    build-essential \
+    gcc \
+    g++ \
+    # Libraries for lxml and other packages
+    libxml2-dev \
+    libxslt1-dev \
+    zlib1g-dev \
+    # Libraries for image processing
+    libjpeg-dev \
+    libpng-dev \
+    # Libraries for scientific computing
+    libopenblas-dev \
+    liblapack-dev \
+    # Browser dependencies (comprehensive set)
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libdbus-1-3 \
+    libxcb1 \
+    libxkbcommon0 \
+    libx11-6 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2 \
+    libatspi2.0-0 \
+    libgtk-3-0 \
+    libxss1 \
+    libgconf-2-4 \
+    fonts-liberation \
+    fonts-dejavu-core \
+    fontconfig \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create user (HF Spaces runs as user 1000)
+RUN useradd -m -u 1000 user
+USER user
+
+# Create playwright cache directory
+RUN mkdir -p /home/user/.cache/ms-playwright
+
+# Copy requirements and install Python dependencies
+COPY --chown=user requirements_full.txt requirements.txt
+
+# Install Python packages in stages for better error handling
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Install core dependencies first
+RUN pip install --no-cache-dir gradio requests beautifulsoup4 html2text nest-asyncio
+
+# Install scientific computing dependencies
+RUN pip install --no-cache-dir numpy pandas scikit-learn
+
+# Install NLP dependencies
+RUN pip install --no-cache-dir nltk
+
+# Install Crawl4AI and Playwright
+RUN pip install --no-cache-dir crawl4ai playwright
+
+# Install optional AI dependencies (don't fail if they don't work)
+RUN pip install --no-cache-dir openai tiktoken transformers || echo "Optional AI dependencies failed"
+
+# Install remaining dependencies
+RUN pip install --no-cache-dir aiohttp asyncio-throttle python-dateutil pytz lxml || echo "Some optional dependencies failed"
+
+# Install Playwright browsers (try multiple approaches)
+RUN python -m playwright install-deps chromium || echo "System deps install failed"
+RUN python -m playwright install chromium || echo "Browser install failed"
+
+# Download NLTK data
+RUN python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('stopwords', quiet=True)" || echo "NLTK data download failed"
+
+# Set proper permissions
+RUN chmod -R 755 /home/user/.cache/ms-playwright 2>/dev/null || echo "Cache permissions failed"
+
+# Copy application files
+COPY --chown=user app_full_featured.py app.py
+COPY --chown=user README_HF.md README.md
+
+# Create a comprehensive startup script
+RUN echo '#!/bin/bash\n\
+echo "🚀 Starting Full-Featured Crawl4AI..."\n\
+echo "📊 System Status Check:"\n\
+echo "🐍 Python: $(python --version)"\n\
+echo "📦 Crawl4AI: $(python -c "import crawl4ai; print(crawl4ai.__version__)" 2>/dev/null || echo "Not available")"\n\
+echo "🎭 Playwright: $(python -c "import playwright; print(playwright.__version__)" 2>/dev/null || echo "Not available")"\n\
+echo "🌐 Gradio: $(python -c "import gradio; print(gradio.__version__)" 2>/dev/null || echo "Not available")"\n\
+echo "🔍 Browser Test:"\n\
+python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); browser = p.chromium.launch(headless=True); browser.close(); p.stop(); print(\"✅ Browser test successful\")" 2>/dev/null || echo "❌ Browser test failed"\n\
+echo "🚀 Launching application..."\n\
+python app.py\n\
+' > /home/user/start.sh && chmod +x /home/user/start.sh
+
+# Expose port
+EXPOSE 7860
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:7860/ || exit 1
+
+# Use the startup script
+CMD ["/home/user/start.sh"]
